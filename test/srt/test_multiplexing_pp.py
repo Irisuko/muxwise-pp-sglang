@@ -80,6 +80,29 @@ class TestSplitPrefill(unittest.TestCase):
 
 
 class TestProtocol(unittest.TestCase):
+    def test_abort_covers_all_lanes_and_emits_terminal_output(self):
+        scheduler = SchedulerMultiplexPPMixin()
+
+        def req(rid):
+            return SimpleNamespace(
+                rid=rid, return_logprob=False, finished=lambda: False, to_abort=False
+            )
+
+        queued, decode0, decode1, prefill = [req(rid) for rid in ("q", "d0", "d1", "p")]
+        scheduler.waiting_queue = [queued]
+        scheduler.running_mbs = [
+            SimpleNamespace(reqs=[decode0]),
+            SimpleNamespace(reqs=[decode1]),
+        ]
+        scheduler.split_prefill_batch = SimpleNamespace(reqs=[prefill])
+        terminal = []
+        scheduler.stream_output = lambda reqs, _: terminal.extend(reqs)
+        scheduler._pp_apply_aborts(["q", "d0", "d1", "p"])
+        self.assertEqual(scheduler.waiting_queue, [])
+        self.assertEqual(terminal, [queued])
+        self.assertEqual(queued.finished_reason.to_json()["type"], "abort")
+        self.assertTrue(all(r.to_abort for r in (decode0, decode1, prefill)))
+
     def test_pending_nccl_host_launch_never_synchronizes(self):
         s = SchedulerMultiplexPPMixin()
         s.prefill_mailbox = SimpleNamespace(poll=lambda: None)

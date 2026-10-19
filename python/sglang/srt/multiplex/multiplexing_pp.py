@@ -551,10 +551,15 @@ class SchedulerMultiplexPPMixin:
         )
 
     def _pp_apply_aborts(self, rids):
+        from sglang.srt.disaggregation.utils import prepare_abort
+
         ids = set(rids)
         for req in self.waiting_queue:
             if req.rid in ids:
-                self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
+                # A terminal batch output also removes tokenizer-side request
+                # state; the upstream bare AbortReq path only wakes the waiter.
+                prepare_abort(req, "Aborted before prefill")
+                self.stream_output([req], req.return_logprob)
         self.waiting_queue = [r for r in self.waiting_queue if r.rid not in ids]
         reqs = [r for mb in self.running_mbs for r in mb.reqs]
         if self.split_prefill_batch:
@@ -660,7 +665,10 @@ class SchedulerMultiplexPPMixin:
                         # This is the upstream PP ring: retire the next microbatch,
                         # relay the previous token result, then send controls/proxy.
                         if self.pp_group.is_last_rank and self.cur_batch:
-                            pp_outputs = {"next_token_ids": result.next_token_ids}
+                            pp_outputs = {
+                                "next_token_ids": result.next_token_ids,
+                                "can_run_cuda_graph": result.can_run_cuda_graph,
+                            }
                             self.pp_group.send_tensor_dict(
                                 pp_outputs, all_gather_group=self.attn_tp_group
                             )
@@ -673,7 +681,11 @@ class SchedulerMultiplexPPMixin:
                             batch = in_flight[next_mb]
                             batch.output_ids = next_outputs["next_token_ids"]
                             self.process_batch_result(
-                                batch, self._pp_result(batch.output_ids, True)
+                                batch,
+                                self._pp_result(
+                                    batch.output_ids,
+                                    next_outputs["can_run_cuda_graph"],
+                                ),
                             )
                             in_flight[next_mb] = None
                         if not self.pp_group.is_last_rank:

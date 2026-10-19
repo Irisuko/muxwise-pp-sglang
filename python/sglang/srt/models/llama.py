@@ -501,7 +501,7 @@ class LlamaForCausalLM(nn.Module):
         split_interval: Tuple[int, int],  # [start, end) 0-based
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Optional[LogitsProcessorOutput]:
+    ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors]]:
         start, end = split_interval
         assert self.start_layer <= start < end <= self.end_layer
         # embed

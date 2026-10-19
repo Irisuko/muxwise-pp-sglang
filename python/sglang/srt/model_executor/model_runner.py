@@ -1936,7 +1936,7 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         forward_count: int = 1,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> LogitsProcessorOutput:
+    ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors]]:
         start_layer = getattr(self.model, "start_layer", 0)
         end_layer = getattr(
             self.model, "end_layer", self.model_config.num_hidden_layers
