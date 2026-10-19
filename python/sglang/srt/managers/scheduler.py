@@ -1320,6 +1320,10 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.enable_pdmux and self.pp_size > 1:
+            if not self._pp_validate_request(req, recv_req):
+                return
+
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
@@ -2005,7 +2009,7 @@ class Scheduler(
         return batch
 
     def run_batch(
-        self, batch: ScheduleBatch
+        self, batch: ScheduleBatch, pp_proxy_tensors: Optional[PPProxyTensors] = None
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
@@ -2024,7 +2028,11 @@ class Scheduler(
                     next_token_ids,
                     can_run_cuda_graph,
                     model_worker_batch,
-                ) = self.tp_worker.forward_batch_split_prefill(batch)
+                ) = self.tp_worker.forward_batch_split_prefill(batch, pp_proxy_tensors)
+                if not self.pp_group.is_last_rank:
+                    pp_hidden_states_proxy_tensors = (
+                        logits_output.tensors if logits_output is not None else None
+                    )
                 bid = model_worker_batch.bid
             elif self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
@@ -2403,7 +2411,11 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
-        if self.enable_pdmux and self.pp_size > 1 and self.split_prefill_batch is not None:
+        if (
+            self.enable_pdmux
+            and self.pp_size > 1
+            and self.split_prefill_batch is not None
+        ):
             return False
         if (
             len(self.waiting_queue) == 0

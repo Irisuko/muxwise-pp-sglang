@@ -1938,7 +1938,9 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput:
         start_layer = getattr(self.model, "start_layer", 0)
-        end_layer = getattr(self.model, "end_layer", self.model_config.num_hidden_layers)
+        end_layer = getattr(
+            self.model, "end_layer", self.model_config.num_hidden_layers
+        )
         if forward_batch.split_index == start_layer or reinit_attn_backend:
             self.attn_backend.init_forward_metadata(forward_batch)
         next_split_index = min(

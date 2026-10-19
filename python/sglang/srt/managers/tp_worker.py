@@ -297,7 +297,8 @@ class TpModelWorker:
             model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)
 
         logits_output, can_run_cuda_graph = self.model_runner.forward(
-            batch.split_forward_batch, split_forward_count=batch.split_forward_count,
+            batch.split_forward_batch,
+            split_forward_count=batch.split_forward_count,
             pp_proxy_tensors=pp_proxy_tensors,
         )
         if logits_output is not None and self.pp_group.is_last_rank:

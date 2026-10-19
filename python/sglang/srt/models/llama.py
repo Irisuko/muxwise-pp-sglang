@@ -526,8 +526,10 @@ class LlamaForCausalLM(nn.Module):
 
         if end == self.end_layer and not self.pp_group.is_last_rank:
             return PPProxyTensors(
-                {"hidden_states": forward_batch.hidden_states,
-                 "residual": forward_batch.residual}
+                {
+                    "hidden_states": forward_batch.hidden_states,
+                    "residual": forward_batch.residual,
+                }
             )
         if end == self.end_layer:
             # norm
