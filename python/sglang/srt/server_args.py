@@ -435,6 +435,25 @@ class ServerArgs:
     # For PD-Multiplexing
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
+    pdmux_pp_policy: str = "alp"
+    pdmux_pp_slo_ttft: float = 5.0
+    pdmux_pp_slo_tpot: float = 0.1
+    pdmux_pp_tpot_coeff: float = 1.0
+    pdmux_pp_rebalance: bool = True
+    pdmux_pp_balance_merge: bool = True
+    pdmux_pp_rebalance_unit: float = 8.0
+    pdmux_pp_rebalance_interval: int = 32
+    pdmux_pp_load_bs_weight: float = 1.0
+    pdmux_pp_load_ctx_weight: float = 0.0001
+    pdmux_pp_reserve_decode: bool = True
+    pdmux_pp_alp_admission: bool = True
+    pdmux_pp_min_budget: int = 1024
+    pdmux_pp_max_budget: int = 16384
+    pdmux_pp_min_residency_steps: int = 16
+    pdmux_pp_hysteresis_steps: int = 4
+    pdmux_pp_fresh_eps: float = 0.25
+    pdmux_pp_arrival_window: float = 10.0
+    pdmux_pp_summary_interval: float = 10.0
     pdmux_pp_max_inflight_prefill: Optional[int] = None
     pdmux_pp_radix_eviction: str = "lru"
     sm_group_num: int = 8
@@ -2611,6 +2630,121 @@ class ServerArgs:
             help="Enable PD-Multiplexing, PD running on greenctx stream.",
         )
         parser.add_argument(
+            "--pdmux-pp-policy",
+            type=str,
+            choices=["static", "alp"],
+            default="alp",
+            help="Policy for MuxWise-PP partitions and prefill token admission.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-slo-ttft",
+            type=float,
+            default=5.0,
+            help="Time-to-first-token SLO in seconds.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-slo-tpot",
+            type=float,
+            default=0.1,
+            help="Time-per-output-token SLO in seconds.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-tpot-coeff",
+            type=float,
+            default=1.0,
+            help="Multiplier on the PP TPOT partition constraint.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-rebalance",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Periodically migrate requests between retired decode microbatches.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-balance-merge",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Assign each completed prefill request to the least-loaded decode microbatch.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-rebalance-unit",
+            type=float,
+            default=8.0,
+            help="Rebalance base unit in equivalent requests; hysteresis margin is 0.4 units.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-rebalance-interval",
+            type=int,
+            default=32,
+            help="Logical control steps between rebalance opportunities.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-load-bs-weight",
+            type=float,
+            default=1.0,
+            help="Request-count coefficient in decode load a*bs+b*sum(context).",
+        )
+        parser.add_argument(
+            "--pdmux-pp-load-ctx-weight",
+            type=float,
+            default=0.0001,
+            help="Context-token coefficient in decode load.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-reserve-decode",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Reserve remaining decode tokens plus pp_size-1 for all active and in-flight requests.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-alp-admission",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Use the warmed RLS prefill model to set the admission token budget.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-min-budget",
+            type=int,
+            default=1024,
+            help="Minimum model-selected prefill admission budget; a single longer request is allowed.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-max-budget",
+            type=int,
+            default=16384,
+            help="Maximum model-selected prefill admission budget (also capped by max-prefill-tokens).",
+        )
+        parser.add_argument(
+            "--pdmux-pp-min-residency-steps",
+            type=int,
+            default=16,
+            help="Minimum local decode steps between ALP partition changes.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-hysteresis-steps",
+            type=int,
+            default=4,
+            help="Consecutive ALP candidate decisions required before switching partitions.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-fresh-eps",
+            type=float,
+            default=0.25,
+            help="Waiting-time fraction of TTFT SLO defining stale requests.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-arrival-window",
+            type=float,
+            default=10.0,
+            help="Window in seconds for effective arriving input token rate.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-summary-interval",
+            type=float,
+            default=10.0,
+            help="Seconds between stage0 PP scheduling summaries.",
+        )
+        parser.add_argument(
             "--pdmux-pp-max-inflight-prefill",
             type=int,
             default=None,
@@ -2756,12 +2890,25 @@ class ServerArgs:
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
 
+        assert self.pdmux_pp_policy in ("static", "alp")
+        assert self.pdmux_pp_slo_ttft > 0 and self.pdmux_pp_slo_tpot > 0
+        assert self.pdmux_pp_tpot_coeff > 0 and self.pdmux_pp_rebalance_unit > 0
+        assert self.pdmux_pp_rebalance_interval > 0
+        assert self.pdmux_pp_load_bs_weight > 0 and self.pdmux_pp_load_ctx_weight >= 0
+        assert 0 < self.pdmux_pp_min_budget <= self.pdmux_pp_max_budget
+        assert (
+            self.pdmux_pp_min_residency_steps >= 0
+            and self.pdmux_pp_hysteresis_steps > 0
+        )
+        assert self.pdmux_pp_arrival_window > 0 and self.pdmux_pp_summary_interval > 0
+        assert 0 <= self.pdmux_pp_fresh_eps <= 1
+
         # Check pdmux
         if self.pdmux_pp_max_inflight_prefill is not None:
             assert self.pdmux_pp_max_inflight_prefill > 0
         if self.enable_pdmux:
             if self.pp_size > 1:
-                assert self.tp_size == 1, "MuxWise-PP P1 supports TP=1"
+                assert self.tp_size == 1, "MuxWise-PP supports TP=1"
                 assert (
                     not self.enable_dp_attention
                 ), "MuxWise-PP does not support DP attention"
@@ -2773,7 +2920,7 @@ class ServerArgs:
                 ), "MuxWise-PP requires local radix cache"
                 assert (
                     not self.enable_priority_scheduling
-                ), "MuxWise-PP P1 uses FCFS admission"
+                ), "MuxWise-PP uses FCFS admission"
             assert (
                 self.chunked_prefill_size == -1
             ), "PD-Multiplexing is not compatible with chunked prefill."

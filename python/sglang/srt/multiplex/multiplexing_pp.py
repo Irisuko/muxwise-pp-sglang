@@ -25,9 +25,19 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.evict_policy import LRUStrategy
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.pdmux_context import set_current_stream_idx
+from sglang.srt.multiplex.pp_policy import (
+    ALPMuxPPPolicy,
+    balanced_assignment,
+    migration_rids,
+    rebalance_pair,
+    req_context,
+    required_throughput,
+)
+from sglang.srt.multiplex.pp_timing import LaneTimings
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +47,7 @@ class ControlKind(str, Enum):
     MERGE = "merge"
     RETRACT = "retract"
     ABORT = "abort"
-    MIGRATE = "migrate"  # P2: ordered rids, source_mb, target_mb; not emitted in P1.
+    MIGRATE = "migrate"
 
 
 @dataclass
@@ -68,10 +78,14 @@ class PPControl:
     abort: list[str] = field(default_factory=list)
     migrations: list[MigrationPlan] = field(default_factory=list)
     evictions: list = field(default_factory=list)
+    hold_mbs: list[int] = field(default_factory=list)
+    required: float = 0.0
+    waiting_tokens: int = 0
+    admission_budget: int = 0
 
 
 class StaticMuxPPPolicy:
-    """P2 replaces this object; only admission/merge hooks run on stage zero."""
+    """Static fallback/ablation; admission and merge hooks run on stage zero."""
 
     def partition(self, config, group_count, decode_bs, has_prefill):
         if not decode_bs:
@@ -315,7 +329,7 @@ class SchedulerMultiplexPPMixin:
 
             prepare_abort(
                 req,
-                "MuxWise-PP P1 supports text/token generation without "
+                "MuxWise-PP supports text/token generation without "
                 "logprobs, hidden-state output, sessions, or constrained decoding.",
                 status_code=HTTPStatus.BAD_REQUEST,
             )
@@ -337,17 +351,36 @@ class SchedulerMultiplexPPMixin:
         )
 
     def _pp_init(self):
-        assert self.tp_size == 1, "MuxWise-PP P1 supports TP=1"
+        assert self.tp_size == 1, "MuxWise-PP supports TP=1"
         assert (
             self.model_config.hf_config.model_type == "llama"
-        ), "MuxWise-PP P1 supports Llama"
+        ), "MuxWise-PP supports Llama"
         assert (
             type(self.tree_cache) is RadixCache
         ), "MuxWise-PP requires the Python RadixCache"
-        if self.server_args.pdmux_pp_radix_eviction == "fifo":
-            self.tree_cache.eviction_strategy = DeterministicRadixFIFO()
+        self.tree_cache.eviction_strategy = (
+            DeterministicRadixFIFO()
+            if self.server_args.pdmux_pp_radix_eviction == "fifo"
+            else LRUStrategy()
+        )
         self._pp_eviction = OrderedRadixEviction(self.tree_cache, self.pp_rank == 0)
-        self.mux_pp_policy = StaticMuxPPPolicy()
+        self._pp_models = ALPMuxPPPolicy(self, StaticMuxPPPolicy())
+        self.mux_pp_policy = (
+            self._pp_models
+            if self.server_args.pdmux_pp_policy == "alp"
+            else self._pp_models.fallback
+        )
+        self._pp_timing = LaneTimings(self)
+        self.tp_worker.pdmux_pp_timing = self._pp_timing
+        self._pp_required = 0.0
+        self._pp_waiting_tokens = 0
+        self._pp_admission_budget = self.max_prefill_tokens
+        self._pp_arrivals = deque()
+        self._pp_pending_merges = [[] for _ in range(self.pp_size)]
+        self._pp_hold = []
+        self._pp_migrations = 0
+        self._pp_stage_status = {}
+        self._pp_last_summary = time.monotonic()
         self.prefill_pp_group = get_pdmux_prefill_pp_group()
         self.prefill_mailbox = PrefillMailbox(self.prefill_pp_group)
         self.running_mbs = [
@@ -387,6 +420,7 @@ class SchedulerMultiplexPPMixin:
         )
 
     def _pp_select_streams(self, idx):
+        self._pp_models.last_switch = self._pp_decode_steps
         self._pp_stream_idx = idx
         set_current_stream_idx(idx)
         self._pp_prefill_stream, self._pp_decode_stream = self.stream_groups[idx]
@@ -422,28 +456,38 @@ class SchedulerMultiplexPPMixin:
     def _pp_make_plan(self):
         if len(self._pp_prefills) >= self._pp_max_prefills or not self.waiting_queue:
             return None
-        budget = self.mux_pp_policy.admission_budget(self)
+        budget = self._pp_admission_budget
         if budget <= 0:
             return None
         # Reserve the entire remaining output, across ALL microbatches, plus
-        # one pipeline turn of safety. P2 may replace this conservative rule.
+        # pp_size-1 safety tokens. Unmerged and ready-to-join requests count too.
         active = [r for mb in self.running_mbs for r in mb.reqs if not r.finished()]
         pending = [r for w in self._pp_prefills.values() for r in w.batch.reqs]
+        pending += self._pp_pending_requests()
         active += pending  # input KV already allocated; reserve future output too
-        reserve = sum(
-            max(0, r.sampling_params.max_new_tokens - len(r.output_ids)) + self.pp_size
-            for r in active
+        reserve = (
+            sum(
+                max(0, r.sampling_params.max_new_tokens - len(r.output_ids))
+                + self.pp_size
+                - 1
+                for r in active
+            )
+            if self.server_args.pdmux_pp_reserve_decode
+            else 0
         )
         target = self.mux_pp_policy.merge_target(self.running_mbs)
         max_bs = self.server_args.max_micro_batch_size or max(
             1, self.max_running_requests // self.pp_size
         )
-        slots = min(
-            self.req_to_token_pool.available_size(),
-            max_bs
-            - sum(not r.finished() for r in self.running_mbs[target].reqs)
-            - len(pending),
-        )
+        if self.server_args.pdmux_pp_balance_merge:
+            free_mb_slots = max_bs * self.pp_size - len(active)
+        else:
+            free_mb_slots = (
+                max_bs
+                - sum(not r.finished() for r in self.running_mbs[target].reqs)
+                - len(pending)
+            )
+        slots = min(self.req_to_token_pool.available_size(), free_mb_slots)
         selected, probes = [], []
         input_tokens = 0
         for req in self.waiting_queue:
@@ -451,9 +495,13 @@ class SchedulerMultiplexPPMixin:
                 break
             req.init_next_round_input(self.tree_cache)
             probes.append((req.rid, len(req.fill_ids), len(req.prefix_indices)))
+            req._pp_effective_tokens = req.extend_input_len
             self.tree_cache.inc_lock_ref(req.last_node)
             needed = (
-                req.extend_input_len + req.sampling_params.max_new_tokens + self.pp_size
+                req.extend_input_len
+                + req.sampling_params.max_new_tokens
+                + self.pp_size
+                - 1
             )
             available = (
                 self.token_to_kv_pool_allocator.available_size()
@@ -527,6 +575,12 @@ class SchedulerMultiplexPPMixin:
 
     def _pp_progress_prefill(self):
         while (envelope := self.prefill_mailbox.poll()) is not None:
+            if envelope["kind"] == "status":
+                if self.pp_rank == 0:
+                    self._pp_stage_status[envelope["stage"]] = envelope["data"]
+                else:
+                    self.prefill_mailbox.outbox.put(envelope)
+                continue
             bid = envelope["batch_id"]
             if envelope["kind"] == "ready":
                 self.prefill_mailbox.ready.add(bid)
@@ -591,6 +645,10 @@ class SchedulerMultiplexPPMixin:
         batch = work.batch
         end = self.tp_worker.model_runner.model.end_layer
         if batch.split_index < end:
+            # ADMIT may have arrived after this step's partition decision.
+            # Keep decode progressing until the next safe mixed/P-only switch.
+            if self.sm_counts[self._pp_stream_idx][0] == 0:
+                return
             count = self.mux_pp_policy.slice_layers(
                 self.pdmux_config, batch.extend_num_tokens, end - batch.split_index
             )
@@ -648,22 +706,253 @@ class SchedulerMultiplexPPMixin:
             None  # Release hidden/residual and attention metadata.
         )
         batch.filter_batch()
-        if not batch.is_empty():
-            if self.running_batch.is_empty():
-                self.running_batch = batch
-            else:
-                self.running_batch.merge_batch(batch)
-        self.running_mbs[mb_id] = self.running_batch
+        targets = dict(zip(work.plan.rids, merge["targets"]))
+        remaining = batch if not batch.is_empty() else None
+        for target in range(self.pp_size):
+            if remaining is None:
+                break
+            indices = [
+                i for i, r in enumerate(remaining.reqs) if targets[r.rid] == target
+            ]
+            if not indices:
+                continue
+            part, remaining = remaining.split_batch(indices)
+            self._pp_pending_merges[target].append(part)
         del self._pp_prefills[merge["batch_id"]]
         if self.split_prefill_batch is batch:
             self.split_prefill_batch = None
         if self.pp_rank == 0:
             assert self._pp_merge_ready.popleft()["batch_id"] == merge["batch_id"]
 
+    def _pp_pending_requests(self):
+        return [
+            r
+            for parts in self._pp_pending_merges
+            for batch in parts
+            for r in batch.reqs
+        ]
+
+    def _pp_join_pending(self, mb_id):
+        batch = self.running_mbs[mb_id]
+        batch.filter_batch()
+        for part in self._pp_pending_merges[mb_id]:
+            if batch.is_empty():
+                batch = part
+            else:
+                batch.merge_batch(part)
+        self._pp_pending_merges[mb_id] = []
+        self.running_mbs[mb_id] = self.running_batch = batch
+
+    def _pp_merge_targets(self, merge):
+        reqs = self._pp_prefills[merge["batch_id"]].batch.reqs
+        args = self.server_args
+        max_bs = args.max_micro_batch_size or max(
+            1, self.max_running_requests // self.pp_size
+        )
+        if not args.pdmux_pp_balance_merge:
+            candidates = [
+                i
+                for i, mb in enumerate(self.running_mbs)
+                if sum(not r.finished() for r in mb.reqs)
+                + len(reqs)
+                + sum(len(b.reqs) for b in self._pp_pending_merges[i])
+                <= max_bs
+            ]
+            if not candidates:
+                return False
+            merge["target_mb"] = min(
+                candidates, key=lambda i: self.running_mbs[i].batch_size()
+            )
+            merge["targets"] = [merge["target_mb"]] * len(reqs)
+        else:
+            merge["targets"] = balanced_assignment(
+                reqs,
+                [mb.reqs for mb in self.running_mbs],
+                [
+                    [r for b in parts for r in b.reqs]
+                    for parts in self._pp_pending_merges
+                ],
+                args.pdmux_pp_load_bs_weight,
+                args.pdmux_pp_load_ctx_weight,
+                max_bs,
+            )
+        return True
+
+    def _pp_rebalance_control(self, packet, in_flight):
+        args = self.server_args
+        if not args.pdmux_pp_rebalance:
+            return
+        a, b, unit = (
+            args.pdmux_pp_load_bs_weight,
+            args.pdmux_pp_load_ctx_weight,
+            args.pdmux_pp_rebalance_unit,
+        )
+        if not self._pp_hold and packet.step % args.pdmux_pp_rebalance_interval == 0:
+            pair = rebalance_pair(
+                [
+                    mb.reqs
+                    + [r for batch in self._pp_pending_merges[i] for r in batch.reqs]
+                    for i, mb in enumerate(self.running_mbs)
+                ],
+                a,
+                b,
+                unit,
+            )
+            if pair:
+                self._pp_hold = list(pair)
+        if self._pp_hold and all(in_flight[i] is None for i in self._pp_hold):
+            source, target = self._pp_hold
+            max_bs = args.max_micro_batch_size or max(
+                1, self.max_running_requests // self.pp_size
+            )
+            rids = migration_rids(
+                self.running_mbs[source].reqs,
+                self.running_mbs[target].reqs
+                + [r for batch in self._pp_pending_merges[target] for r in batch.reqs],
+                a,
+                b,
+                unit,
+                max_bs,
+            )
+            if rids:
+                packet.migrations = [MigrationPlan(rids, source, target)]
+            self._pp_hold = []
+        packet.hold_mbs = self._pp_hold.copy()
+
+    def _pp_apply_migrations(self, packet, in_flight):
+        self._pp_hold = packet.hold_mbs.copy()
+        for plan in packet.migrations:
+            source, target = plan.source_mb, plan.target_mb
+            assert in_flight[source] is None and in_flight[target] is None
+            src, dst = self.running_mbs[source], self.running_mbs[target]
+            src.filter_batch()
+            dst.filter_batch()
+            ids = set(plan.rids)
+            move_indices = [i for i, r in enumerate(src.reqs) if r.rid in ids]
+            assert len(move_indices) == len(ids)
+            moved, kept = src.split_batch(move_indices)
+            self.running_mbs[source] = kept or ScheduleBatch(reqs=[])
+            if dst.is_empty():
+                self.running_mbs[target] = moved
+            else:
+                dst.merge_batch(moved)
+            self._pp_migrations += len(ids)
+            logger.debug(
+                "MuxWise-PP migrate step=%s source=%s target=%s rids=%s",
+                packet.step,
+                source,
+                target,
+                plan.rids,
+            )
+        self.running_batch = self.running_mbs[packet.mb_id]
+
+    def _pp_effective_input(self, req):
+        # Read-only prefix length: arrivals must not split/access radix nodes
+        # outside the replicated admission probes.
+        if self.tree_cache.disable:
+            return len(req.origin_input_ids)
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        key = RadixKey(req.origin_input_ids[:-1], req.extra_key)
+        node, matched = self.tree_cache.root_node, 0
+        while len(key):
+            node = node.children.get(self.tree_cache.get_child_key_fn(key))
+            if node is None:
+                break
+            n = self.tree_cache.key_match_fn(node.key, key)
+            matched += n
+            if n < len(node.key):
+                break
+            key = key[n:]
+        return len(req.origin_input_ids) - matched
+
+    def _pp_update_demand(self, packet):
+        args = self.server_args
+        now = time.monotonic()
+        if self.pp_rank == 0:
+            for r in self.waiting_queue:
+                if not hasattr(r, "_pp_arrival"):
+                    r._pp_arrival = now
+                    r._pp_effective_tokens = self._pp_effective_input(r)
+                    self._pp_arrivals.append((now, r._pp_effective_tokens))
+            while (
+                self._pp_arrivals
+                and self._pp_arrivals[0][0] < now - args.pdmux_pp_arrival_window
+            ):
+                self._pp_arrivals.popleft()
+            waiting = [
+                (r._pp_arrival, r._pp_effective_tokens) for r in self.waiting_queue
+            ]
+            self._pp_required = required_throughput(
+                waiting,
+                self._pp_arrivals,
+                now,
+                args.pdmux_pp_slo_ttft,
+                args.pdmux_pp_slo_tpot,
+                args.pdmux_pp_fresh_eps,
+                args.pdmux_pp_arrival_window,
+            )
+            self._pp_waiting_tokens = sum(n for _, n in waiting)
+            self._pp_admission_budget = self.mux_pp_policy.admission_budget(self)
+            packet.required, packet.waiting_tokens, packet.admission_budget = (
+                self._pp_required,
+                self._pp_waiting_tokens,
+                self._pp_admission_budget,
+            )
+        else:
+            self._pp_required, self._pp_waiting_tokens, self._pp_admission_budget = (
+                packet.required,
+                packet.waiting_tokens,
+                packet.admission_budget,
+            )
+
+    def _pp_summary(self):
+        now = time.monotonic()
+        if now - self._pp_last_summary < self.server_args.pdmux_pp_summary_interval:
+            return
+        data = dict(
+            partition=self._pp_stream_idx,
+            samples=[self._pp_models.decode.count, self._pp_models.prefill.count],
+            mape=[self._pp_models.decode.mape, self._pp_models.prefill.mape],
+            by_partition=[row.copy() for row in self._pp_models.samples_by_partition],
+            at=now,
+        )
+        if self.pp_rank:
+            self._pp_last_summary = now
+            self.prefill_mailbox.outbox.put(
+                dict(kind="status", stage=self.pp_rank, data=data)
+            )
+            return
+        self._pp_stage_status[0] = data
+        # Give downstream reports a control turn to arrive before logging;
+        # include all stages from this reporting interval, not the previous one.
+        if len(self._pp_stage_status) != self.pp_size or any(
+            now - v["at"] > self.server_args.pdmux_pp_summary_interval / 2
+            for v in self._pp_stage_status.values()
+        ):
+            return
+        self._pp_last_summary = now
+        logger.info(
+            "MuxWise-PP summary stages=%s mbs=%s waiting=%s/%s required=%s budget=%s inflight=%s pending=%s migrations=%s",
+            self._pp_stage_status,
+            [
+                (len(mb.reqs), sum(req_context(r) for r in mb.reqs))
+                for mb in self.running_mbs
+            ],
+            len(self.waiting_queue),
+            self._pp_waiting_tokens,
+            self._pp_required,
+            self._pp_admission_budget,
+            len(self._pp_prefills),
+            len(self._pp_pending_requests()),
+            self._pp_migrations,
+        )
+
     def _pp_abort_ids(self, requests):
         aborts = [r for r in requests if isinstance(r, AbortReq)]
         reqs = self.waiting_queue + [r for mb in self.running_mbs for r in mb.reqs]
         reqs += [r for w in self._pp_prefills.values() for r in w.batch.reqs]
+        reqs += self._pp_pending_requests()
         return sorted(
             {
                 r.rid
@@ -686,6 +975,7 @@ class SchedulerMultiplexPPMixin:
         self.waiting_queue = [r for r in self.waiting_queue if r.rid not in ids]
         reqs = [r for mb in self.running_mbs for r in mb.reqs]
         reqs += [r for w in self._pp_prefills.values() for r in w.batch.reqs]
+        reqs += self._pp_pending_requests()
         for req in reqs:
             if req.rid in ids and not req.finished():
                 req.to_abort = True
@@ -716,6 +1006,7 @@ class SchedulerMultiplexPPMixin:
                     self.running_batch = self.running_mbs[mb_id]
                     self.cur_batch = None
                     self.last_batch = None
+                    self._pp_timing.drain()
                     self._pp_adjust_streams(self.running_batch.batch_size())
                     with torch.cuda.stream(self._pp_decode_stream):
                         set_pdmux_status(False)
@@ -739,19 +1030,25 @@ class SchedulerMultiplexPPMixin:
                         if self.pp_rank == 0:
                             packet.abort = self._pp_abort_ids(packet.requests)
                         self._pp_apply_aborts(packet.abort)
+                        assert in_flight[mb_id] is None
                         if self.pp_rank == 0 and self._pp_merge_ready:
-                            if self._pp_merge_ready[0]["target_mb"] == mb_id:
-                                packet.merge = self._pp_merge_ready[0]
+                            merge = self._pp_merge_ready[0]
+                            if (
+                                self._pp_merge_targets(merge)
+                                and merge["target_mb"] == mb_id
+                            ):
+                                packet.merge = merge
                         if packet.merge:
                             self._pp_merge(packet.merge, mb_id)
+                        self._pp_join_pending(mb_id)
+                        if self.pp_rank == 0:
+                            self._pp_rebalance_control(packet, in_flight)
+                        self._pp_apply_migrations(packet, in_flight)
+                        self._pp_update_demand(packet)
                         if self.pp_rank == 0:
                             packet.plan = self._pp_make_plan()
                         elif packet.plan:
                             self._pp_apply_plan(packet.plan)
-                        if packet.migrations:
-                            raise NotImplementedError(
-                                "P2 microbatch migration is not enabled"
-                            )
                         self.running_batch.filter_batch()
                         # Only stage zero decides retraction. Full output reservation
                         # normally makes this branch unnecessary; keep an explicit command.
@@ -768,7 +1065,10 @@ class SchedulerMultiplexPPMixin:
                                     r.rid for r in self.running_batch.reqs
                                 ]
                         self._pp_retract(packet.retract)
-                        if not self.running_batch.is_empty():
+                        if (
+                            not self.running_batch.is_empty()
+                            and mb_id not in self._pp_hold
+                        ):
                             self.running_batch.prepare_for_decode()
                             self.cur_batch = self.running_batch
                         self.running_mbs[mb_id] = self.running_batch
@@ -828,9 +1128,11 @@ class SchedulerMultiplexPPMixin:
                                     all_gather_group=self.attn_tp_group,
                                 )
                         pp_outputs = next_outputs
+                    self._pp_summary()
                     step += 1
                 idle = (
                     not self._pp_prefills
+                    and not any(self._pp_pending_merges)
                     and not self.waiting_queue
                     and all(
                         not mb.reqs or all(r.finished() for r in mb.reqs)

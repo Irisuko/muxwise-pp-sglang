@@ -255,6 +255,23 @@ class TpModelWorker:
                 )
             )
 
+        timer = getattr(self, "pdmux_pp_timing", None)
+        sample = (
+            timer.begin(
+                "decode",
+                [
+                    (
+                        len(model_worker_batch.reqs)
+                        if hasattr(model_worker_batch, "reqs")
+                        else len(model_worker_batch.seq_lens_cpu)
+                    ),
+                    float(model_worker_batch.seq_lens_cpu.sum()) / 1e4,
+                    1,
+                ],
+            )
+            if timer
+            else None
+        )
         if self.pp_group.is_last_rank:
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
@@ -276,12 +293,16 @@ class TpModelWorker:
             else:
                 next_token_ids = self.model_runner.sample(logits_output, forward_batch)
 
+            if timer:
+                timer.end(sample)
             return logits_output, next_token_ids, can_run_cuda_graph
         else:
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if timer:
+                timer.end(sample)
             return pp_proxy_tensors.tensors, None, can_run_cuda_graph
 
     def forward_batch_split_prefill(
@@ -296,6 +317,22 @@ class TpModelWorker:
         else:
             model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)
 
+        timer = getattr(self, "pdmux_pp_timing", None)
+        sample = (
+            timer.begin(
+                "prefill",
+                [
+                    batch.extend_num_tokens / 1e3,
+                    sum(n * n for n in batch.extend_lens) / 1e6,
+                    sum(n * p for n, p in zip(batch.extend_lens, batch.prefix_lens))
+                    / 1e6,
+                    1,
+                ],
+                batch.split_forward_count,
+            )
+            if timer
+            else None
+        )
         logits_output, can_run_cuda_graph = self.model_runner.forward(
             batch.split_forward_batch,
             split_forward_count=batch.split_forward_count,
@@ -305,6 +342,8 @@ class TpModelWorker:
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
         else:
             next_token_ids = None
+        if timer:
+            timer.end(sample)
         return logits_output, next_token_ids, can_run_cuda_graph, model_worker_batch
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):

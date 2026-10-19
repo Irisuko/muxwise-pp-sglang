@@ -1612,6 +1612,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        self.seq_lens_cpu_cache = None
         bs = len(self.reqs)
 
         if (
@@ -1727,6 +1728,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
+        if self.seq_lens_cpu_cache is not None:
+            self.seq_lens_cpu_cache = self.seq_lens_cpu_cache[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
@@ -1746,6 +1749,82 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.filter_batch(keep_indices_device)
 
+    def split_batch(self, keep_indices, drop_indices=None):
+        """Partition a retired text decode batch without sharing mutable state.
+
+        Also accepts a completed split-prefill after first-token processing.
+        Callers must ensure no forward/result processing still references this
+        batch. Pool/cache/Req ownership is transferred, never copied or freed.
+        Transient forward inputs are rebuilt by prepare_for_decode().
+        """
+        import copy
+
+        assert self.output_ids is not None, "Cannot split a batch awaiting results"
+        assert not self.model_config.is_encoder_decoder and self.spec_info is None
+        assert self.split_forward_batch is None, "Prefill is still executing"
+        if drop_indices is None:
+            drop_indices = [i for i in range(len(self.reqs)) if i not in keep_indices]
+        assert sorted(keep_indices + drop_indices) == list(range(len(self.reqs)))
+
+        def subset(indices):
+            if not indices:
+                return None
+            batch = copy.copy(self)
+            batch.reqs = [self.reqs[i] for i in indices]
+            idx = torch.tensor(indices, dtype=torch.int64, device=self.device)
+            for name in ("req_pool_indices", "seq_lens", "orig_seq_lens", "output_ids"):
+                value = getattr(self, name)
+                setattr(batch, name, value[idx] if value is not None else None)
+            batch.seq_lens_sum = batch.seq_lens.sum().item()
+            if self.seq_lens_cpu_cache is not None:
+                batch.seq_lens_cpu_cache = self.seq_lens_cpu_cache[indices]
+            for name in (
+                "multimodal_inputs",
+                "top_logprobs_nums",
+                "token_ids_logprobs",
+            ):
+                value = getattr(self, name)
+                setattr(batch, name, [value[i] for i in indices] if value else None)
+            batch.return_logprob = any(r.return_logprob for r in batch.reqs)
+            batch.has_stream = any(r.stream for r in batch.reqs)
+            batch.has_grammar = any(r.grammar for r in batch.reqs)
+            batch.sampling_info = copy.copy(self.sampling_info)
+            old = self.sampling_info.penalizer_orchestrator
+            orch = copy.copy(old)
+            orch.batch = batch
+            orch.penalizers = {
+                kind: copy.copy(pen) for kind, pen in old.penalizers.items()
+            }
+            for pen in orch.penalizers.values():
+                pen.orchestrator = orch
+            batch.sampling_info.penalizer_orchestrator = orch
+            # Slicing must also happen for a full-size partition: each retained
+            # penalty tensor then has independent storage and the right weakref.
+            batch.sampling_info.filter_batch(indices, idx)
+            for name in ("linear_penalty", "vocab_mask"):
+                value = getattr(self.sampling_info, name)
+                setattr(
+                    batch.sampling_info, name, value[idx] if value is not None else None
+                )
+            if self.sampling_info.grammars is not None:
+                batch.sampling_info.grammars = [
+                    self.sampling_info.grammars[i] for i in indices
+                ]
+            batch.forward_mode = ForwardMode.DECODE
+            batch.input_ids = batch.out_cache_loc = None
+            batch.prefix_lens = batch.extend_lens = batch.extend_logprob_start_lens = (
+                None
+            )
+            batch.extend_input_logprob_token_ids = None
+            batch.extend_num_tokens = 0
+            batch.decoding_reqs = batch.next_batch_sampling_info = None
+            batch.split_index = 0
+            batch.split_prefill_finished = False
+            batch.split_forward_count = 1
+            return batch
+
+        return subset(keep_indices), subset(drop_indices)
+
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
@@ -1760,6 +1839,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
+        self.seq_lens_cpu_cache = (
+            torch.cat([self.seq_lens_cpu_cache, other.seq_lens_cpu_cache])
+            if self.seq_lens_cpu_cache is not None
+            and other.seq_lens_cpu_cache is not None
+            else None
+        )
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum

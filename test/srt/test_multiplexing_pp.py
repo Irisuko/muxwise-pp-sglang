@@ -92,6 +92,7 @@ class TestProtocol(unittest.TestCase):
 
         queued, decode0, decode1, prefill = [req(rid) for rid in ("q", "d0", "d1", "p")]
         scheduler.waiting_queue = [queued]
+        scheduler._pp_pending_merges = []
         scheduler.running_mbs = [
             SimpleNamespace(reqs=[decode0]),
             SimpleNamespace(reqs=[decode1]),

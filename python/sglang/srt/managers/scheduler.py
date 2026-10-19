@@ -2414,7 +2414,10 @@ class Scheduler(
         if (
             self.enable_pdmux
             and self.pp_size > 1
-            and bool(getattr(self, "_pp_prefills", {}))
+            and (
+                bool(getattr(self, "_pp_prefills", {}))
+                or any(getattr(self, "_pp_pending_merges", []))
+            )
         ):
             return False
         if (
