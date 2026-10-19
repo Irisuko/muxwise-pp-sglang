@@ -2744,9 +2744,12 @@ class ServerArgs:
 
         # Check pdmux
         if self.enable_pdmux:
-            assert (
-                self.pp_size == 1
-            ), "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
+            if self.pp_size > 1:
+                assert self.tp_size == 1, "MuxWise-PP P1 supports TP=1"
+                assert not self.enable_dp_attention, "MuxWise-PP does not support DP attention"
+                assert not self.speculative_algorithm, "MuxWise-PP does not support speculative decoding"
+                assert not self.enable_hierarchical_cache and not self.enable_lmcache, "MuxWise-PP requires local radix cache"
+                assert not self.enable_priority_scheduling, "MuxWise-PP P1 uses FCFS admission"
             assert (
                 self.chunked_prefill_size == -1
             ), "PD-Multiplexing is not compatible with chunked prefill."

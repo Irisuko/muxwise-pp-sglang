@@ -1937,18 +1937,20 @@ class ModelRunner:
         forward_count: int = 1,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput:
-        if forward_batch.split_index == self.model.start_layer or reinit_attn_backend:
+        start_layer = getattr(self.model, "start_layer", 0)
+        end_layer = getattr(self.model, "end_layer", self.model_config.num_hidden_layers)
+        if forward_batch.split_index == start_layer or reinit_attn_backend:
             self.attn_backend.init_forward_metadata(forward_batch)
         next_split_index = min(
             forward_batch.split_index + forward_count,
-            self.model.end_layer,
+            end_layer,
         )
         ret = self.model.forward_split_prefill(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             (forward_batch.split_index, next_split_index),
-            pp_proxy_tensors=pp_proxy_tensors,
+            **({"pp_proxy_tensors": pp_proxy_tensors} if self.pp_size > 1 else {}),
         )
         forward_batch.split_index = next_split_index
         return ret

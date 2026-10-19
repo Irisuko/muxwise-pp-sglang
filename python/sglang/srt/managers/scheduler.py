@@ -150,6 +150,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing import SchedulerMultiplexMixin
+from sglang.srt.multiplex.multiplexing_pp import SchedulerMultiplexPPMixin
 from sglang.srt.multiplex.pdmux_context import (
     get_sm_counts,
     get_stream_groups,
@@ -228,6 +229,7 @@ class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
+    SchedulerMultiplexPPMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -2401,6 +2403,8 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
+        if self.enable_pdmux and self.pp_size > 1 and self.split_prefill_batch is not None:
+            return False
         if (
             len(self.waiting_queue) == 0
             and self.running_batch.is_empty()
@@ -2864,7 +2868,9 @@ def run_scheduler_process(
 
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
-            if scheduler.enable_pdmux:
+            if scheduler.enable_pdmux and server_args.pp_size > 1:
+                scheduler.event_loop_pdmux_pp()
+            elif scheduler.enable_pdmux:
                 scheduler.event_loop_pdmux()
             elif server_args.pp_size > 1:
                 scheduler.event_loop_pp()
