@@ -1283,6 +1283,12 @@ def get_moe_tp_group() -> GroupCoordinator:
 get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
+_PDMUX_PREFILL_PP: Optional[GroupCoordinator] = None
+
+
+def get_pdmux_prefill_pp_group() -> GroupCoordinator:
+    assert _PDMUX_PREFILL_PP is not None, "PDMux prefill PP group is not initialized"
+    return _PDMUX_PREFILL_PP
 
 
 def get_pp_group() -> GroupCoordinator:
@@ -1530,6 +1536,17 @@ def initialize_model_parallel(
         use_custom_allreduce=False,
         group_name="pp",
     )
+    if duplicate_tp_group and pipeline_model_parallel_size > 1:
+        global _PDMUX_PREFILL_PP
+        _PDMUX_PREFILL_PP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="pdmux_prefill_pp",
+            pynccl_use_current_stream=True,
+        )
+        _PDMUX_PREFILL_PP.pynccl_comm.disabled = False
 
 
 def ensure_model_parallel_initialized(
@@ -1659,6 +1676,10 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+    global _PDMUX_PREFILL_PP
+    if _PDMUX_PREFILL_PP:
+        _PDMUX_PREFILL_PP.destroy()
+    _PDMUX_PREFILL_PP = None
 
     global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]

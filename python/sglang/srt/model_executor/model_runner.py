@@ -1935,18 +1935,20 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         reinit_attn_backend: bool = False,
         forward_count: int = 1,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput:
-        if forward_batch.split_index == 0 or reinit_attn_backend:
+        if forward_batch.split_index == self.model.start_layer or reinit_attn_backend:
             self.attn_backend.init_forward_metadata(forward_batch)
         next_split_index = min(
             forward_batch.split_index + forward_count,
-            self.model_config.num_hidden_layers,
+            self.model.end_layer,
         )
         ret = self.model.forward_split_prefill(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             (forward_batch.split_index, next_split_index),
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         forward_batch.split_index = next_split_index
         return ret
@@ -2026,6 +2028,7 @@ class ModelRunner:
                 forward_batch,
                 reinit_attn_backend=reinit_attn_backend,
                 forward_count=split_forward_count,
+                pp_proxy_tensors=pp_proxy_tensors,
             )
         elif forward_batch.forward_mode.is_idle():
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)

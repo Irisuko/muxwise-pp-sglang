@@ -284,19 +284,23 @@ class TpModelWorker:
             )
             return pp_proxy_tensors.tensors, None, can_run_cuda_graph
 
-    def forward_batch_split_prefill(self, batch: ScheduleBatch):
-        if batch.split_index == 0:
+    def forward_batch_split_prefill(
+        self, batch: ScheduleBatch, pp_proxy_tensors: Optional[PPProxyTensors] = None
+    ):
+        if batch.split_forward_batch is None:
             model_worker_batch = batch.get_model_worker_batch()
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
             batch.split_forward_batch = forward_batch
+            forward_batch.split_index = batch.split_index
             batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
         else:
             model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)
 
         logits_output, can_run_cuda_graph = self.model_runner.forward(
-            batch.split_forward_batch, split_forward_count=batch.split_forward_count
+            batch.split_forward_batch, split_forward_count=batch.split_forward_count,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
-        if logits_output:
+        if logits_output is not None and self.pp_group.is_last_rank:
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
         else:
             next_token_ids = None

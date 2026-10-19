@@ -500,11 +500,17 @@ class LlamaForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         split_interval: Tuple[int, int],  # [start, end) 0-based
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Optional[LogitsProcessorOutput]:
         start, end = split_interval
+        assert self.start_layer <= start < end <= self.end_layer
         # embed
-        if start == 0:
-            if input_embeds is None:
+        if start == self.start_layer:
+            if not self.pp_group.is_first_rank:
+                assert pp_proxy_tensors is not None
+                forward_batch.hidden_states = pp_proxy_tensors["hidden_states"]
+                forward_batch.residual = pp_proxy_tensors["residual"]
+            elif input_embeds is None:
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
                 forward_batch.hidden_states = input_embeds
@@ -518,7 +524,12 @@ class LlamaForCausalLM(nn.Module):
                 forward_batch.residual,
             )
 
-        if end == self.model.config.num_hidden_layers:
+        if end == self.end_layer and not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {"hidden_states": forward_batch.hidden_states,
+                 "residual": forward_batch.residual}
+            )
+        if end == self.end_layer:
             # norm
             hidden_states, _ = self.model.norm(
                 forward_batch.hidden_states, forward_batch.residual
