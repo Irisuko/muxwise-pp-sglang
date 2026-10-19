@@ -423,7 +423,17 @@ class ForwardBatch:
         # Init position information
         if ret.forward_mode.is_decode():
             if ret.positions is None:
-                ret.positions = clamp_position(batch.seq_lens)
+                if (
+                    model_runner.server_args.enable_pdmux
+                    and model_runner.server_args.pp_size > 1
+                ):
+                    # Lazy Inductor compilation synchronizes the entire device;
+                    # an asynchronous PP lane can still have a peer-dependent op.
+                    ret.positions = torch.clamp(batch.seq_lens - 1, min=0).to(
+                        torch.int64
+                    )
+                else:
+                    ret.positions = clamp_position(batch.seq_lens)
         else:
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32

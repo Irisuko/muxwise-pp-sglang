@@ -2414,7 +2414,7 @@ class Scheduler(
         if (
             self.enable_pdmux
             and self.pp_size > 1
-            and self.split_prefill_batch is not None
+            and bool(getattr(self, "_pp_prefills", {}))
         ):
             return False
         if (

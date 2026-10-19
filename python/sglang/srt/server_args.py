@@ -435,6 +435,8 @@ class ServerArgs:
     # For PD-Multiplexing
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
+    pdmux_pp_max_inflight_prefill: Optional[int] = None
+    pdmux_pp_radix_eviction: str = "lru"
     sm_group_num: int = 8
 
     def __post_init__(self):
@@ -2609,6 +2611,18 @@ class ServerArgs:
             help="Enable PD-Multiplexing, PD running on greenctx stream.",
         )
         parser.add_argument(
+            "--pdmux-pp-max-inflight-prefill",
+            type=int,
+            default=None,
+            help="Maximum unmerged prefill batches in MuxWise-PP (default: pp_size).",
+        )
+        parser.add_argument(
+            "--pdmux-pp-radix-eviction",
+            choices=["lru", "fifo"],
+            default="lru",
+            help="Stage0 radix victim selection, replayed by all PP stages.",
+        )
+        parser.add_argument(
             "--pdmux-config-path",
             type=str,
             default=None,
@@ -2743,6 +2757,8 @@ class ServerArgs:
             ), "chunked_prefill_size must be divisible by page_size"
 
         # Check pdmux
+        if self.pdmux_pp_max_inflight_prefill is not None:
+            assert self.pdmux_pp_max_inflight_prefill > 0
         if self.enable_pdmux:
             if self.pp_size > 1:
                 assert self.tp_size == 1, "MuxWise-PP P1 supports TP=1"

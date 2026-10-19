@@ -11,6 +11,8 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.multiplex.multiplexing_pp import (
     DeterministicRadixFIFO,
+    OrderedRadixEviction,
+    PrefillWork,
     SchedulerMultiplexPPMixin,
     StaticMuxPPPolicy,
 )
@@ -94,7 +96,9 @@ class TestProtocol(unittest.TestCase):
             SimpleNamespace(reqs=[decode0]),
             SimpleNamespace(reqs=[decode1]),
         ]
-        scheduler.split_prefill_batch = SimpleNamespace(reqs=[prefill])
+        scheduler._pp_prefills = {
+            0: SimpleNamespace(batch=SimpleNamespace(reqs=[prefill]))
+        }
         terminal = []
         scheduler.stream_output = lambda reqs, _: terminal.extend(reqs)
         scheduler._pp_apply_aborts(["q", "d0", "d1", "p"])
@@ -106,14 +110,14 @@ class TestProtocol(unittest.TestCase):
     def test_pending_nccl_host_launch_never_synchronizes(self):
         s = SchedulerMultiplexPPMixin()
         s.prefill_mailbox = SimpleNamespace(poll=lambda: None)
-        s._pp_prefill_state = "receiving"
-        s._pp_io_launched = threading.Event()
+        work = PrefillWork(None, None, "receiving", launched=threading.Event())
+        s._pp_prefills = {0: work}
 
         class UnrecordedEvent:
             def query(self):
                 raise AssertionError("Unrecorded event must not be queried")
 
-        s._pp_prefill_event = UnrecordedEvent()
+        work.event = UnrecordedEvent()
         s._pp_progress_prefill()
         s.mux_pp_policy = StaticMuxPPPolicy()
         s.pdmux_config = PDMuxConfig(manual_divisions=[[96, 32, 1]])
@@ -121,6 +125,19 @@ class TestProtocol(unittest.TestCase):
         s._pp_stream_idx = 0
         s._pp_adjust_streams(8)
         self.assertEqual(s._pp_stream_idx, 0)
+
+    def test_local_fifo_skips_sent_batches_but_keeps_their_kv_owner(self):
+        s = SchedulerMultiplexPPMixin()
+        first = PrefillWork(None, object(), "done")
+        second = PrefillWork(SimpleNamespace(batch_id=2), object(), "waiting")
+        third = PrefillWork(SimpleNamespace(batch_id=3), object(), "waiting")
+        s._pp_prefills = {1: first, 2: second, 3: third}
+        s._pp_envelopes = {}
+        s.prefill_mailbox = SimpleNamespace(poll=lambda: None)
+        s._pp_progress_prefill()
+        self.assertIs(s.split_prefill_batch, second.batch)
+        self.assertEqual(len(s._pp_prefills), 3)
+        self.assertEqual(third.state, "waiting")
 
     def test_partition_and_least_loaded_hooks(self):
         p = StaticMuxPPPolicy()
@@ -164,6 +181,39 @@ class TestProtocol(unittest.TestCase):
                 len(c.match_prefix(RadixKey(key)).device_indices) for c, _, _ in caches
             ]
             self.assertEqual(lengths[0], lengths[1])
+
+
+class TestOrderedLRU(unittest.TestCase):
+    def test_lru_victims_replayed_with_different_clocks_and_ids(self):
+        caches = []
+        for rank in range(2):
+            freed = []
+            cache = RadixCache(
+                None,
+                SimpleNamespace(
+                    device="cpu", free=lambda v, f=freed: f.extend(v.tolist())
+                ),
+                1,
+            )
+            for key in ([1, 2, 3], [1, 2, 4], [5, 6]):
+                cache.insert(RadixKey(key), torch.tensor(key) + rank * 100)
+            for n, node in enumerate(cache._collect_leaves()):
+                node.last_access_time = n if rank == 0 else -n
+            caches.append((cache, freed, OrderedRadixEviction(cache, rank == 0)))
+        commands = []
+        for cache, freed, journal in caches:
+            journal.begin(commands)
+            cache.evict(3)
+            journal.end()
+        self.assertEqual(caches[0][1], [v - 100 for v in caches[1][1]])
+        self.assertTrue(commands[0][1])
+        for key in ([1, 2, 3], [1, 2, 4], [5, 6]):
+            self.assertEqual(
+                *[
+                    len(c.match_prefix(RadixKey(key)).device_indices)
+                    for c, _, _ in caches
+                ]
+            )
 
 
 if __name__ == "__main__":
