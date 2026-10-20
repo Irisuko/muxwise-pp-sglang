@@ -20,6 +20,8 @@ class PDMuxConfig:
     )  # [prefill_sm, decode_sm, decode_bs_threshold]
     split_forward_token_budget: int = 65536
     decode_bs_divisor: int = 36
+    pp_profile_decode: bool = False
+    pp_prefetch: bool = False
 
 
 def load_pdmux_config(config_path: str) -> PDMuxConfig:
@@ -50,6 +52,8 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         manual_divisions=manual_divisions,
         split_forward_token_budget=raw.get("split_forward_token_budget", 65536),
         decode_bs_divisor=raw.get("decode_bs_divisor", 36),
+        pp_profile_decode=raw.get("pp_profile_decode", False),
+        pp_prefetch=raw.get("pp_prefetch", False),
     )
 
 

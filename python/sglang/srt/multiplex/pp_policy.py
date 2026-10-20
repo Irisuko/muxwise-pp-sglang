@@ -11,12 +11,13 @@ import numpy as np
 
 
 class OnlineRLS:
-    def __init__(self, dim, bias_index, forgetting=0.9975, warmup=16):
+    def __init__(self, dim, bias_index, forgetting=0.9975, warmup=16, warm_start=True):
         self.theta = np.zeros(dim, dtype=np.float64)
         self.P = 1.25 * np.eye(dim)
         self.bias_index = bias_index
         self.forgetting = forgetting
         self.warmup = warmup
+        self.warm_start = warm_start
         self.count = 0
         self.errors = deque(maxlen=128)
 
@@ -35,13 +36,19 @@ class OnlineRLS:
         x = np.asarray(x, dtype=np.float64)
         if not np.all(np.isfinite(x)) or not np.isfinite(observed) or observed <= 0:
             return
-        # No startup profiler: seed only the intercept from the first real
-        # observation. A zero prediction with relative clipping cannot learn.
-        if not self.count:
+        # Fit cold observations with ordinary RLS. Seeding a large intercept
+        # and clipping all later residuals can collapse P before workload terms
+        # are learned. A negative linear prediction then gets stuck at 1us:
+        # clipping to 40% of that floor permits only a 0.4us correction forever.
+        if not self.warm_start and not self.count:
             self.theta[self.bias_index] = observed
-        pred = self.predict(x)
+        raw = float(self.theta @ x)
+        pred = max(raw, 1e-6)
         self.errors.append(abs(observed - pred) / max(observed, 1e-6))
-        error = np.clip(observed - pred, -0.4 * abs(pred), 0.4 * abs(pred))
+        if self.warm_start and (self.count < self.warmup or raw <= 0):
+            error = observed - raw
+        else:
+            error = np.clip(observed - pred, -0.4 * abs(pred), 0.4 * abs(pred))
         px = self.P @ x
         gain = px / (self.forgetting + x @ px)
         self.theta += gain * error
@@ -58,13 +65,33 @@ def sm_features(base, sm, total_sm):
 
 def choose_partition(sm_counts, decode_times, prefill_rates, required, pp_size, tpot):
     candidates = [i for i, (p, d) in enumerate(sm_counts) if p > 0 and d > 0]
-    safe = [i for i in candidates if pp_size * decode_times[i] <= tpot]
-    enough = [i for i in safe if prefill_rates[i] >= required]
+    safe = [
+        i
+        for i in candidates
+        if np.isfinite(decode_times[i]) and pp_size * decode_times[i] <= tpot
+    ]
+    enough = [i for i in safe if np.isfinite(required) and prefill_rates[i] >= required]
     if enough:
         return min(enough, key=lambda i: (sm_counts[i][0], i))
     if safe:
         return max(safe, key=lambda i: (sm_counts[i][0], -i))
     return max(candidates, key=lambda i: (sm_counts[i][1], -i))
+
+
+def calibrated_decode_time(records, bs, mean_context):
+    """Upper grid corner, never extrapolate from an unvisited SM partition.
+
+    The table covers uniform and maximally ragged shapes at each mean context.
+    Beyond graph/context coverage is unknown (infinity), not a tiny prediction.
+    """
+    eligible = [(b, c, t) for b, c, t in records if b >= bs and c >= mean_context]
+    if not eligible:
+        return float("inf")
+    b = min(v[0] for v in eligible)
+    c = min(v[1] for v in eligible)
+    # A monotonic upper envelope avoids interpreting noisy profiling as a speedup
+    # with increasing work. Sampling is outside the graph: reserve 1ms for it.
+    return max(t for rb, rc, t in records if rb <= b and rc <= c)
 
 
 def required_throughput(waiting, arrivals, now, ttft, tpot, fresh=0.25, window=10):
@@ -136,7 +163,15 @@ class ALPMuxPPPolicy:
         self.args = scheduler.server_args
         self.fallback = fallback
         self.decode = OnlineRLS(5, 2)
-        self.prefill = OnlineRLS(7, 3)
+        self.decode_calibration = {}
+        self.decode_corrections = [deque(maxlen=128) for _ in scheduler.sm_counts]
+        self.decode_scale = [1.2 for _ in scheduler.sm_counts]
+        # One observation per complete local batch: a final slice includes
+        # norm/logits/sampling and is not another interchangeable decoder layer.
+        self.prefill = OnlineRLS(9, 4)
+        self.prefill_slice = OnlineRLS(7, 3, warm_start=False)  # P2 diagnostic
+        self.prefill_pending = {}
+        self.prefill_legacy_batch_errors = deque(maxlen=128)
         self.samples_by_partition = [[0, 0] for _ in scheduler.sm_counts]
         self.last_switch = 0
         self.candidate = None
@@ -149,7 +184,42 @@ class ALPMuxPPPolicy:
     def observe(self, kind, base, idx, seconds):
         model = self.decode if kind == "decode" else self.prefill
         model.update(self.features(kind, base, idx), seconds)
+        if kind == "decode" and idx in self.decode_calibration:
+            reference = calibrated_decode_time(
+                self.decode_calibration[idx], base[0], base[1] * 1e4 / max(base[0], 1)
+            )
+            if np.isfinite(reference):
+                self.decode_corrections[idx].append(seconds / reference)
+                if self.samples_by_partition[idx][0] % 16 == 15:
+                    self.decode_scale[idx] = max(
+                        1.2, float(np.quantile(self.decode_corrections[idx], 0.9))
+                    )
         self.samples_by_partition[idx][kind == "prefill"] += 1
+
+    def observe_prefill_slice(self, key, base, idx, seconds, layers, final):
+        old_base = [*base[:3], 1]
+        old_features = self.features("prefill", old_base, idx)
+        old_prediction = (
+            self.prefill_slice.predict(old_features)
+            if self.prefill_slice.count
+            else seconds / layers
+        )
+        self.prefill_slice.update(old_features, seconds / layers)
+        self.samples_by_partition[idx][1] += 1
+        features = np.asarray(self.features("prefill", base, idx))
+        accumulated = self.prefill_pending.setdefault(
+            key, [np.zeros_like(features), 0.0, 0, 0.0]
+        )
+        accumulated[0] += features * layers
+        accumulated[1] += seconds
+        accumulated[2] += layers
+        accumulated[3] += old_prediction * layers
+        if final:
+            x, elapsed, count, legacy = self.prefill_pending.pop(key)
+            self.prefill_legacy_batch_errors.append(
+                abs(elapsed - legacy) / max(elapsed, 1e-6)
+            )
+            self.prefill.update(x / count, elapsed / count)
 
     def _prefill_base(self):
         work = next(
@@ -170,6 +240,7 @@ class ALPMuxPPPolicy:
             sum(lens) / 1e3,
             sum(n * n for n in lens) / 1e6,
             sum(n * p for n, p in zip(lens, past)) / 1e6,
+            len(lens),
             1,
         ]
 
@@ -178,7 +249,9 @@ class ALPMuxPPPolicy:
         if (
             not decode_bs
             or not has_prefill
-            or not (self.decode.ready and self.prefill.ready)
+            or not (
+                self.decode_calibration or (self.decode.ready and self.prefill.ready)
+            )
         ):
             return fallback
         s = self.s
@@ -195,10 +268,28 @@ class ALPMuxPPPolicy:
             s.tp_worker.model_runner.model.end_layer
             - s.tp_worker.model_runner.model.start_layer
         )
-        td = [
-            self.decode.predict(self.features("decode", db, i))
-            for i in range(group_count)
-        ]
+        if self.decode_calibration:
+            workloads = [
+                (len(mb.reqs), sum(req_context(r) for r in mb.reqs) / len(mb.reqs))
+                for mb in s.running_mbs
+                if mb.reqs
+            ]
+            td = [
+                max(
+                    calibrated_decode_time(
+                        self.decode_calibration.get(i, []), n, context
+                    )
+                    for n, context in workloads
+                )
+                * self.decode_scale[i]
+                + 0.001
+                for i in range(group_count)
+            ]
+        else:
+            td = [
+                self.decode.predict(self.features("decode", db, i))
+                for i in range(group_count)
+            ]
         rates = [
             pb[0]
             * 1e3
@@ -209,7 +300,7 @@ class ALPMuxPPPolicy:
             s.sm_counts,
             td,
             rates,
-            s._pp_required,
+            s._pp_required if self.prefill.ready else float("inf"),
             s.pp_size,
             self.args.pdmux_pp_slo_tpot * self.args.pdmux_pp_tpot_coeff,
         )
@@ -217,7 +308,12 @@ class ALPMuxPPPolicy:
             self.candidate, self.candidate_count = chosen, 0
         self.candidate_count += 1
         # Endpoint transitions cannot wait: prefill must have nonzero SMs.
-        if 0 < s._pp_stream_idx < group_count - 1:
+        current_safe = (
+            np.isfinite(td[s._pp_stream_idx])
+            and s.pp_size * td[s._pp_stream_idx]
+            <= self.args.pdmux_pp_slo_tpot * self.args.pdmux_pp_tpot_coeff
+        )
+        if 0 < s._pp_stream_idx < group_count - 1 and current_safe:
             if (
                 s._pp_decode_steps - self.last_switch
                 < self.args.pdmux_pp_min_residency_steps
@@ -247,7 +343,13 @@ class ALPMuxPPPolicy:
         # A bounded grid avoids assuming a noisy fitted polynomial is monotonic.
         for budget in list(range(lower, upper, 256)) + [upper]:
             ratio = budget / n
-            base = [budget / 1e3, pb[1] * ratio**2, pb[2] * ratio, 1]
+            base = [
+                budget / 1e3,
+                pb[1] * ratio**2,
+                pb[2] * ratio,
+                max(1, pb[3] * ratio),
+                1,
+            ]
             if (
                 layers * self.prefill.predict(self.features("prefill", base, idx))
                 <= target

@@ -498,6 +498,7 @@ class CudaGraphRunner:
             decode_stream_groups.append(torch.cuda.Stream())
         num_stream = len(decode_stream_groups)
         for stream_idx in range(num_stream):
+            partition_memory_before = torch.cuda.memory_reserved()
             with freeze_gc(
                 self.model_runner.server_args.enable_cudagraph_gc
             ), graph_capture(
@@ -549,6 +550,14 @@ class CudaGraphRunner:
 
                         # Save gemlite cache after each capture
                         save_gemlite_cache()
+            if self.enable_pdmux and self.pp_size > 1:
+                logger.info(
+                    "MuxWise-PP graph memory partition=%s graphs=%s added_reserved_MiB=%.2f total_reserved_MiB=%.2f",
+                    stream_idx,
+                    len(self.capture_bs),
+                    (torch.cuda.memory_reserved() - partition_memory_before) / 2**20,
+                    torch.cuda.memory_reserved() / 2**20,
+                )
 
         if self.enable_profile_cuda_graph:
             log_message = (

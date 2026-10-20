@@ -142,6 +142,43 @@ class PrefillWork:
     launched: object = None
     proxy: object = None
     tokens: object = None
+    recv_slot: Optional[int] = None
+
+
+class PrefillReceivePool:
+    """Two persistent input slots: one computing and one receiving ahead.
+
+    Residuals can alias received storage throughout the layer stack, so a slot
+    remains owned until the final compute/send event has completed. Preallocation
+    also avoids cudaMalloc synchronizing an unmatched NCCL receive at runtime.
+    """
+
+    def __init__(self, max_tokens, hidden_size, dtype, device):
+        self.buffers = [
+            {
+                name: torch.empty((max_tokens, hidden_size), dtype=dtype, device=device)
+                for name in ("hidden_states", "residual")
+            }
+            for _ in range(2)
+        ]
+        self.free = deque(range(2))
+
+    def acquire(self, specs):
+        assert {name for name, _, _ in specs} == set(self.buffers[0])
+        for name, shape, dtype in specs:
+            storage = self.buffers[0][name]
+            assert len(shape) == 2 and 0 < shape[0] <= storage.shape[0]
+            assert shape[1] == storage.shape[1] and dtype == storage.dtype
+        if not self.free:
+            return None
+        slot = self.free.popleft()
+        return slot, {
+            name: self.buffers[slot][name][: shape[0]] for name, shape, _ in specs
+        }
+
+    def release(self, slot):
+        assert 0 <= slot < len(self.buffers) and slot not in self.free
+        self.free.append(slot)
 
 
 class OrderedRadixEviction:
@@ -221,6 +258,8 @@ class PrefillMailbox:
         self.outbox = queue.Queue()
         self.errors = queue.Queue()
         self.transfers = queue.Queue()
+        self.pending_sends = {}
+        self.send_lock = threading.Lock()
         self.ready = set()
         self.src = group.ranks[(group.rank_in_group - 1) % group.world_size]
         self.dst = group.ranks[(group.rank_in_group + 1) % group.world_size]
@@ -255,7 +294,25 @@ class PrefillMailbox:
         while True:
             bid = torch.empty(1, dtype=torch.int64)
             dist.recv(bid, src=self.dst, group=self.group.cpu_group, tag=317)
-            self.inbox.put(dict(kind="ready", batch_id=int(bid.item())))
+            self._dispatch_ready(int(bid.item()))
+
+    def _dispatch_ready(self, bid):
+        with self.send_lock:
+            task = self.pending_sends.pop(bid, None)
+        if task is None:
+            self.inbox.put(dict(kind="ready", batch_id=bid))
+        else:
+            self.transfers.put(task)
+
+    def send_when_ready(self, bid, tensors, stream):
+        # Register BEFORE publishing the hidden envelope. READY can then launch
+        # the matching send without another decode/control turn. A scheduler
+        # D2H copy must not delay the peer of an already-posted NCCL receive.
+        launched, event = threading.Event(), torch.cuda.Event()
+        with self.send_lock:
+            assert bid not in self.pending_sends
+            self.pending_sends[bid] = (True, tensors, stream, launched, event)
+        return launched, event
 
     def _send(self):
         while True:
@@ -372,6 +429,7 @@ class SchedulerMultiplexPPMixin:
         )
         self._pp_timing = LaneTimings(self)
         self.tp_worker.pdmux_pp_timing = self._pp_timing
+        self.tp_worker.model_runner.model.pdmux_pp_timing = self._pp_timing
         self._pp_required = 0.0
         self._pp_waiting_tokens = 0
         self._pp_admission_budget = self.max_prefill_tokens
@@ -400,6 +458,28 @@ class SchedulerMultiplexPPMixin:
         self._pp_cached_tokens = 0
         self._pp_overlap_launches = 0
         self._pp_select_streams(0)
+        if self.pdmux_config.pp_profile_decode:
+            from sglang.srt.multiplex.pp_profile import profile_decode
+
+            self._pp_models.decode_calibration = profile_decode(self)
+        self._pp_receive_pool = None
+        if self.pdmux_config.pp_prefetch and self.pp_rank:
+            self._pp_receive_stream = torch.cuda.Stream()
+            self._pp_receive_pool = PrefillReceivePool(
+                max(self.max_prefill_tokens, self.model_config.context_len),
+                self.model_config.hidden_size,
+                self.model_config.dtype,
+                self.device,
+            )
+            logger.info(
+                "MuxWise-PP receive slots=2 reserved_MiB=%.1f",
+                sum(
+                    t.numel() * t.element_size()
+                    for slot in self._pp_receive_pool.buffers
+                    for t in slot.values()
+                )
+                / 2**20,
+            )
         logger.info(
             "MuxWise-PP stage=%s layers=[%s,%s) capacity=%s partitions=%s radix=%s graphs=%s",
             self.pp_rank,
@@ -422,6 +502,7 @@ class SchedulerMultiplexPPMixin:
     def _pp_select_streams(self, idx):
         self._pp_models.last_switch = self._pp_decode_steps
         self._pp_stream_idx = idx
+        self._pp_timing.switch(idx)
         set_current_stream_idx(idx)
         self._pp_prefill_stream, self._pp_decode_stream = self.stream_groups[idx]
         self.tp_worker.model_runner.update_decode_attn_backend(idx)
@@ -443,8 +524,11 @@ class SchedulerMultiplexPPMixin:
                 return
             if work.event is not None and not work.event.query():
                 return
-        self._pp_prefill_stream.synchronize()
-        self._pp_decode_stream.synchronize()
+        with self._pp_timing.region("prefill", "switch"), self._pp_timing.region(
+            "decode", "switch"
+        ):
+            self._pp_prefill_stream.synchronize()
+            self._pp_decode_stream.synchronize()
         self._pp_select_streams(idx)
         logger.debug(
             "MuxWise-PP partition=%s decode_bs=%s SMs=%s",
@@ -574,6 +658,49 @@ class SchedulerMultiplexPPMixin:
         )
 
     def _pp_progress_prefill(self):
+        try:
+            self._pp_progress_prefill_impl()
+        finally:
+            self._pp_timing.prefill_state()
+
+    def _pp_begin_receive(self, work, envelope):
+        assert envelope["plan"] == work.plan
+        pool = getattr(self, "_pp_receive_pool", None)
+        if pool is None:
+            tensors = {
+                k: torch.empty(shape, dtype=dtype, device=self.device)
+                for k, shape, dtype in envelope["tensors"]
+            }
+            stream = self._pp_prefill_stream
+        else:
+            acquired = pool.acquire(envelope["tensors"])
+            if acquired is None:
+                return False
+            work.recv_slot, tensors = acquired
+            stream = self._pp_receive_stream
+        work.proxy = PPProxyTensors(tensors)
+        work.launched, work.event = self.prefill_mailbox.transfer(
+            False, tensors, stream
+        )
+        work.state = "receiving"
+        self.prefill_mailbox.outbox.put(dict(kind="ready", batch_id=work.plan.batch_id))
+        return True
+
+    def _pp_post_receives(self):
+        for work in self._pp_prefills.values():
+            if work.state != "waiting":
+                continue
+            envelope = self._pp_envelopes.get(work.plan.batch_id)
+            if envelope is None or not self._pp_begin_receive(work, envelope):
+                break
+            del self._pp_envelopes[work.plan.batch_id]
+
+    def _pp_release_receive(self, work):
+        if work.recv_slot is not None:
+            self._pp_receive_pool.release(work.recv_slot)
+            work.recv_slot = None
+
+    def _pp_progress_prefill_impl(self):
         while (envelope := self.prefill_mailbox.poll()) is not None:
             if envelope["kind"] == "status":
                 if self.pp_rank == 0:
@@ -597,31 +724,22 @@ class SchedulerMultiplexPPMixin:
             else:
                 assert bid not in self._pp_envelopes
                 self._pp_envelopes[bid] = envelope
-        # Local FIFO: a sent batch remains allocated until ordered MERGE, but
-        # no longer owns the compute slot. Receive only the FIFO head to bound
-        # activation memory and avoid queueing unmatched NCCL on the stream.
+        # Keep compute FIFO while allowing at most one additional input to arrive.
+        # A sent batch retains its KV ownership until the ordered MERGE.
+        if getattr(self, "_pp_receive_pool", None) is not None:
+            self._pp_post_receives()
         work = next((w for w in self._pp_prefills.values() if w.state != "done"), None)
         self.split_prefill_batch = work.batch if work else None
         if work is None:
             return
         if work.state == "waiting":
-            envelope = self._pp_envelopes.pop(work.plan.batch_id, None)
+            envelope = self._pp_envelopes.get(work.plan.batch_id)
             if envelope is None:
                 return
-            assert envelope["plan"] == work.plan
-            tensors = {
-                k: torch.empty(shape, dtype=dtype, device=self.device)
-                for k, shape, dtype in envelope["tensors"]
-            }
-            work.proxy = PPProxyTensors(tensors)
-            work.launched, work.event = self.prefill_mailbox.transfer(
-                False, tensors, self._pp_prefill_stream
-            )
-            work.state = "receiving"
-            self.prefill_mailbox.outbox.put(
-                dict(kind="ready", batch_id=work.plan.batch_id)
-            )
-        if work.state == "offering":
+            if not self._pp_begin_receive(work, envelope):
+                return
+            del self._pp_envelopes[work.plan.batch_id]
+        if work.state == "offering" and work.launched is None:
             if work.plan.batch_id not in self.prefill_mailbox.ready:
                 return
             self.prefill_mailbox.ready.remove(work.plan.batch_id)
@@ -633,14 +751,18 @@ class SchedulerMultiplexPPMixin:
             if not work.launched.is_set():
                 return
             work.launched = None
+            if work.state == "offering":
+                work.state = "sending"
         if work.event is not None and not work.event.query():
             return
         if work.state == "sending":
             work.state, work.proxy = "done", None
             work.batch.split_forward_batch = None
+            self._pp_release_receive(work)
             self.split_prefill_batch = None
             return
         if work.state == "receiving":
+            self._pp_prefill_stream.wait_event(work.event)
             work.state = "compute"
         batch = work.batch
         end = self.tp_worker.model_runner.model.end_layer
@@ -653,6 +775,7 @@ class SchedulerMultiplexPPMixin:
                 self.pdmux_config, batch.extend_num_tokens, end - batch.split_index
             )
             batch.split_forward_count = count
+            self._pp_timing.mark("prefill", "compute_slot")
             result = self.run_batch(batch, pp_proxy_tensors=work.proxy)
             batch.split_index += count
             self._pp_prefill_steps += 1
@@ -676,9 +799,14 @@ class SchedulerMultiplexPPMixin:
             )
             work.state = "done"
             work.batch.split_forward_batch = None
+            self._pp_release_receive(work)
             self.split_prefill_batch = None
         else:
             tensors = work.proxy.tensors
+            if self.pdmux_config.pp_prefetch:
+                work.launched, work.event = self.prefill_mailbox.send_when_ready(
+                    work.plan.batch_id, tensors, self._pp_prefill_stream
+                )
             self.prefill_mailbox.outbox.put(
                 dict(
                     kind="hidden",
@@ -914,7 +1042,15 @@ class SchedulerMultiplexPPMixin:
             partition=self._pp_stream_idx,
             samples=[self._pp_models.decode.count, self._pp_models.prefill.count],
             mape=[self._pp_models.decode.mape, self._pp_models.prefill.mape],
+            prefill_slice_mape=self._pp_models.prefill_slice.mape,
+            prefill_legacy_batch_mape=(
+                sum(self._pp_models.prefill_legacy_batch_errors)
+                / len(self._pp_models.prefill_legacy_batch_errors)
+                if self._pp_models.prefill_legacy_batch_errors
+                else None
+            ),
             by_partition=[row.copy() for row in self._pp_models.samples_by_partition],
+            timing=self._pp_timing.snapshot(),
             at=now,
         )
         if self.pp_rank:
@@ -1006,6 +1142,7 @@ class SchedulerMultiplexPPMixin:
                     self.running_batch = self.running_mbs[mb_id]
                     self.cur_batch = None
                     self.last_batch = None
+                    self._pp_timing.mark("decode", "control")
                     self._pp_timing.drain()
                     self._pp_adjust_streams(self.running_batch.batch_size())
                     with torch.cuda.stream(self._pp_decode_stream):
@@ -1015,11 +1152,13 @@ class SchedulerMultiplexPPMixin:
                             packet = PPControl(step, mb_id, requests=requests)
                         else:
                             obj = [None]
+                            self._pp_timing.mark("decode", "control_recv")
                             dist.recv_object_list(
                                 obj,
                                 src=self.pp_group.ranks[self.pp_rank - 1],
                                 group=self.world_group.cpu_group,
                             )
+                            self._pp_timing.mark("decode", "control")
                             packet = obj[0]
                             assert (packet.step, packet.mb_id) == (step, mb_id)
                         self._pp_eviction.begin(packet.evictions)
@@ -1076,6 +1215,7 @@ class SchedulerMultiplexPPMixin:
                         self._pp_eviction.end()
                     with torch.cuda.stream(self._pp_prefill_stream):
                         set_pdmux_status(True)
+                        self._pp_timing.mark("decode", "prefill_launch")
                         previous_slices = self._pp_prefill_steps
                         self._pp_progress_prefill()
                         if self.cur_batch and self._pp_prefill_steps > previous_slices:
@@ -1083,11 +1223,15 @@ class SchedulerMultiplexPPMixin:
                     with torch.cuda.stream(self._pp_decode_stream):
                         set_pdmux_status(False)
                         result = None
+                        self._pp_timing.mark(
+                            "decode", "empty" if not self.cur_batch else "launch"
+                        )
                         if self.cur_batch:
                             result = self.run_batch(self.cur_batch)
                             self._pp_decode_steps += 1
                         # This is the upstream PP ring: retire the next microbatch,
                         # relay the previous token result, then send controls/proxy.
+                        self._pp_timing.mark("decode", "send")
                         if self.pp_group.is_last_rank and self.cur_batch:
                             pp_outputs = {
                                 "next_token_ids": result.next_token_ids,
@@ -1099,9 +1243,11 @@ class SchedulerMultiplexPPMixin:
                         next_mb = (mb_id + 1) % self.pp_size
                         next_outputs = None
                         if in_flight[next_mb] is not None:
+                            self._pp_timing.mark("decode", "token")
                             next_outputs = self.pp_group.recv_tensor_dict(
                                 all_gather_group=self.attn_tp_group
                             )
+                            self._pp_timing.mark("decode", "retire")
                             batch = in_flight[next_mb]
                             batch.output_ids = next_outputs["next_token_ids"]
                             self.process_batch_result(
@@ -1112,6 +1258,7 @@ class SchedulerMultiplexPPMixin:
                                 ),
                             )
                             in_flight[next_mb] = None
+                        self._pp_timing.mark("decode", "send")
                         if not self.pp_group.is_last_rank:
                             if pp_outputs is not None:
                                 self.pp_group.send_tensor_dict(
@@ -1128,6 +1275,7 @@ class SchedulerMultiplexPPMixin:
                                     all_gather_group=self.attn_tp_group,
                                 )
                         pp_outputs = next_outputs
+                    self._pp_timing.mark("decode", "control")
                     self._pp_summary()
                     step += 1
                 idle = (
@@ -1141,12 +1289,14 @@ class SchedulerMultiplexPPMixin:
                     and not any(in_flight)
                 )
                 if idle:
+                    if self._pp_receive_pool is not None:
+                        assert len(self._pp_receive_pool.free) == 2
                     with torch.cuda.stream(self._pp_decode_stream):
                         self.check_memory()
                         self.check_tree_cache()
                     if not self._pp_idle_logged:
                         logger.info(
-                            "MuxWise-PP idle self-check PASS stage=%s free_kv=%s evictable=%s free_reqs=%s prefill_slices=%s decode_steps=%s cached_tokens=%s overlap_launches=%s",
+                            "MuxWise-PP idle self-check PASS stage=%s free_kv=%s evictable=%s free_reqs=%s prefill_slices=%s decode_steps=%s cached_tokens=%s overlap_launches=%s free_receive_slots=%s",
                             self.pp_rank,
                             self.token_to_kv_pool_allocator.available_size(),
                             self.tree_cache.evictable_size(),
@@ -1155,8 +1305,14 @@ class SchedulerMultiplexPPMixin:
                             self._pp_decode_steps,
                             self._pp_cached_tokens,
                             self._pp_overlap_launches,
+                            (
+                                len(self._pp_receive_pool.free)
+                                if self._pp_receive_pool
+                                else 0
+                            ),
                         )
                     self._pp_idle_logged = True
+                    self._pp_timing.mark("decode", "empty")
                     if self.pp_rank == 0:
                         time.sleep(0.001)
                 else:

@@ -532,6 +532,8 @@ class LlamaForCausalLM(nn.Module):
                 }
             )
         if end == self.end_layer:
+            timer = getattr(self, "pdmux_pp_timing", None)
+            head_sample = timer.begin("prefill_head", []) if timer else None
             # norm
             hidden_states, _ = self.model.norm(
                 forward_batch.hidden_states, forward_batch.residual
@@ -541,6 +543,8 @@ class LlamaForCausalLM(nn.Module):
             result = self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
             )
+            if timer:
+                timer.end(head_sample)
         else:
             result = None
 

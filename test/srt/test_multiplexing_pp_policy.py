@@ -136,7 +136,7 @@ class TestALPTransitions(unittest.TestCase):
         self.assertEqual(p.partition(cfg, 5, 1, True), 1)
         p.decode.count = p.prefill.count = 16
         p.decode.theta[2] = 0.01
-        p.prefill.theta[3] = 0.001
+        p.prefill.theta[4] = 0.001
         self.assertEqual(p.partition(cfg, 5, 1, True), 1)
         s._pp_decode_steps = 20
         self.assertEqual(p.partition(cfg, 5, 1, True), 1)

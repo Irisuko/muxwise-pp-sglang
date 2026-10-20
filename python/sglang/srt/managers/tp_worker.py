@@ -247,8 +247,11 @@ class TpModelWorker:
 
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
+        timer = getattr(self, "pdmux_pp_timing", None)
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
+            if timer:
+                timer.mark("decode", "proxy")
             pp_proxy_tensors = PPProxyTensors(
                 self.pp_group.recv_tensor_dict(
                     all_gather_group=self.get_attention_tp_group()
@@ -256,6 +259,8 @@ class TpModelWorker:
             )
 
         timer = getattr(self, "pdmux_pp_timing", None)
+        if timer:
+            timer.mark("decode", "launch")
         sample = (
             timer.begin(
                 "decode",
@@ -326,9 +331,21 @@ class TpModelWorker:
                     sum(n * n for n in batch.extend_lens) / 1e6,
                     sum(n * p for n, p in zip(batch.extend_lens, batch.prefix_lens))
                     / 1e6,
+                    len(batch.reqs),
                     1,
                 ],
                 batch.split_forward_count,
+                batch_key=id(batch),
+                detail=(
+                    "final"
+                    if batch.split_index + batch.split_forward_count
+                    == self.model_runner.model.end_layer
+                    else (
+                        "first"
+                        if batch.split_index == self.model_runner.model.start_layer
+                        else "middle"
+                    )
+                ),
             )
             if timer
             else None
@@ -339,7 +356,10 @@ class TpModelWorker:
             pp_proxy_tensors=pp_proxy_tensors,
         )
         if logits_output is not None and self.pp_group.is_last_rank:
+            sample_token = timer.begin("prefill_sample", []) if timer else None
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+            if timer:
+                timer.end(sample_token)
         else:
             next_token_ids = None
         if timer:

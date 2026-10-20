@@ -2,6 +2,7 @@
 
 import threading
 import unittest
+from queue import Queue
 from types import SimpleNamespace
 
 import torch
@@ -12,6 +13,8 @@ from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.multiplex.multiplexing_pp import (
     DeterministicRadixFIFO,
     OrderedRadixEviction,
+    PrefillMailbox,
+    PrefillReceivePool,
     PrefillWork,
     SchedulerMultiplexPPMixin,
     StaticMuxPPPolicy,
@@ -82,6 +85,43 @@ class TestSplitPrefill(unittest.TestCase):
 
 
 class TestProtocol(unittest.TestCase):
+    def test_prefetched_ready_dispatches_without_scheduler_progress(self):
+        mailbox = PrefillMailbox.__new__(PrefillMailbox)
+        task = (True, {"hidden_states": object()}, object(), object(), object())
+        mailbox.pending_sends = {12: task}
+        mailbox.send_lock = threading.Lock()
+        mailbox.transfers, mailbox.inbox = Queue(), Queue()
+        mailbox._dispatch_ready(12)
+        self.assertIs(mailbox.transfers.get_nowait(), task)
+        self.assertEqual(mailbox.pending_sends, {})
+        self.assertTrue(mailbox.inbox.empty())
+        mailbox._dispatch_ready(13)
+        self.assertEqual(mailbox.inbox.get_nowait(), dict(kind="ready", batch_id=13))
+
+    def test_receive_slots_bound_memory_and_preserve_live_inputs(self):
+        pool = PrefillReceivePool(16, 4, torch.float32, "cpu")
+        specs = [
+            (name, (8, 4), torch.float32) for name in ("hidden_states", "residual")
+        ]
+        first, a = pool.acquire(specs)
+        second, b = pool.acquire(specs)
+        a["residual"].fill_(7)
+        b["residual"].fill_(9)
+        self.assertTrue(torch.all(a["residual"] == 7))
+        self.assertIsNone(pool.acquire(specs))
+        with self.assertRaises(AssertionError):
+            pool.acquire([(name, (17, 4), dtype) for name, _, dtype in specs])
+        pool.release(second)
+        reused, c = pool.acquire(specs)
+        self.assertEqual(second, reused)
+        self.assertEqual(b["hidden_states"].data_ptr(), c["hidden_states"].data_ptr())
+        self.assertTrue(torch.all(a["residual"] == 7))
+        pool.release(first)
+        with self.assertRaises(AssertionError):
+            pool.release(first)
+        pool.release(reused)
+        self.assertEqual(len(pool.free), 2)
+
     def test_abort_covers_all_lanes_and_emits_terminal_output(self):
         scheduler = SchedulerMultiplexPPMixin()
 
@@ -110,6 +150,7 @@ class TestProtocol(unittest.TestCase):
 
     def test_pending_nccl_host_launch_never_synchronizes(self):
         s = SchedulerMultiplexPPMixin()
+        s._pp_timing = SimpleNamespace(prefill_state=lambda: None)
         s.prefill_mailbox = SimpleNamespace(poll=lambda: None)
         work = PrefillWork(None, None, "receiving", launched=threading.Event())
         s._pp_prefills = {0: work}
@@ -134,6 +175,7 @@ class TestProtocol(unittest.TestCase):
         third = PrefillWork(SimpleNamespace(batch_id=3), object(), "waiting")
         s._pp_prefills = {1: first, 2: second, 3: third}
         s._pp_envelopes = {}
+        s._pp_timing = SimpleNamespace(prefill_state=lambda: None)
         s.prefill_mailbox = SimpleNamespace(poll=lambda: None)
         s._pp_progress_prefill()
         self.assertIs(s.split_prefill_batch, second.batch)
