@@ -26,6 +26,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Type
 
 import torch
+from sglang.srt.disaggregation.p5a_timing import kv_stamp
 
 from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
 from sglang.srt.disaggregation.utils import (
@@ -632,6 +633,7 @@ class SchedulerDisaggregationPrefillMixin:
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
+        kv_stamp("send", req, start_idx, end_idx, last_chunk)
         req.disagg_kv_sender.send(page_indices)
 
     # PP

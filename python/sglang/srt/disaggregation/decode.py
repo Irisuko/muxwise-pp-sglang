@@ -27,6 +27,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 
 import torch
+from sglang.srt.disaggregation.p5a_timing import kv_stamp
 from torch.distributed import ProcessGroup
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -605,7 +606,7 @@ class DecodeTransferQueue:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-
+                kv_stamp("received", decode_req.req)
                 idx = decode_req.metadata_buffer_index
                 (
                     output_id,
