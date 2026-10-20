@@ -16,7 +16,7 @@
         "MC_TRANSFER_TIMEOUT": "300",
         "MC_TCP_STATUS_TIMEOUT_SEC": "120",
         "MC_TCP_PROGRESS_TIMEOUT_SEC": "120",
-        "SGLANG_DISAGGREGATION_QUEUE_SIZE": "1",
+        "SGLANG_DISAGGREGATION_QUEUE_SIZE": "4",
         "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE": "4",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "3600",
         "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "3600",
@@ -32,5 +32,6 @@
       }
     }
   },
-  "timeout_rationale": "The 300-request trace preflight demonstrates a sustained arrival/service-rate mismatch. Align PD bootstrap/wait deadlines with the unchanged 3600-second client budget so CPU-staged transfer queueing is not mistaken for peer death."
+  "timeout_rationale": "The 300-request trace preflight demonstrates a sustained arrival/service-rate mismatch. Align PD bootstrap/wait deadlines with the unchanged 3600-second client budget so CPU-staged transfer queueing is not mistaken for peer death.",
+  "concurrency_rationale": "Keep the P3b default four sender shards. The initial one-shard developmental configuration caused head-of-line blocking between the two decode peers; queue admission is addressed by Mooncake capacities and deadlines instead."
 }
