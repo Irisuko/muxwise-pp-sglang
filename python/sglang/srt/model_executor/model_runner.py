@@ -779,6 +779,18 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
+        if self.server_args.pdmux_prefill_mlp_chunk_tokens:
+            configure = getattr(self.model, "configure_prefill_mlp_chunking", None)
+            if configure is None:
+                raise ValueError(
+                    "This model does not support split-prefill MLP token chunking"
+                )
+            configure(self.server_args.pdmux_prefill_mlp_chunk_tokens)
+            logger.info(
+                "Split-prefill MLP chunk tokens=%s",
+                self.server_args.pdmux_prefill_mlp_chunk_tokens,
+            )
+
         get_offloader().post_init()
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":

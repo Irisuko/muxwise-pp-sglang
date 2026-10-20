@@ -435,6 +435,7 @@ class ServerArgs:
     # For PD-Multiplexing
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
+    pdmux_prefill_mlp_chunk_tokens: int = 0
     pdmux_pp_policy: str = "alp"
     pdmux_pp_slo_ttft: float = 5.0
     pdmux_pp_slo_tpot: float = 0.1
@@ -2630,6 +2631,12 @@ class ServerArgs:
             help="Enable PD-Multiplexing, PD running on greenctx stream.",
         )
         parser.add_argument(
+            "--pdmux-prefill-mlp-chunk-tokens",
+            type=int,
+            default=0,
+            help="Token rows per Llama split-prefill MLP call (TP1, PP1 or PP>1); 0 disables chunking.",
+        )
+        parser.add_argument(
             "--pdmux-pp-policy",
             type=str,
             choices=["static", "alp"],
@@ -2904,6 +2911,11 @@ class ServerArgs:
         assert 0 <= self.pdmux_pp_fresh_eps <= 1
 
         # Check pdmux
+        assert self.pdmux_prefill_mlp_chunk_tokens >= 0
+        if self.pdmux_prefill_mlp_chunk_tokens:
+            assert (
+                self.enable_pdmux and self.tp_size == 1
+            ), "Prefill MLP chunking requires pdmux with TP1"
         if self.pdmux_pp_max_inflight_prefill is not None:
             assert self.pdmux_pp_max_inflight_prefill > 0
         if self.enable_pdmux:

@@ -90,6 +90,7 @@ class LlamaMLP(nn.Module):
                 "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.prefill_chunk_tokens = 0
 
     def forward(
         self,
@@ -97,6 +98,25 @@ class LlamaMLP(nn.Module):
         forward_batch=None,
         use_reduce_scatter: bool = False,
     ):
+        limit = self.prefill_chunk_tokens
+        if (
+            limit > 0
+            and x.shape[0] > limit
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_split_prefill()
+        ):
+            # MLP rows are independent. Only the wide gate/up and activation
+            # intermediates are bounded; attention still sees the whole batch.
+            output = torch.empty_like(x)
+            for start in range(0, x.shape[0], limit):
+                end = min(start + limit, x.shape[0])
+                output[start:end].copy_(
+                    self._forward_mlp(x[start:end], use_reduce_scatter)
+                )
+            return output
+        return self._forward_mlp(x, use_reduce_scatter)
+
+    def _forward_mlp(self, x, use_reduce_scatter=False):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
@@ -271,7 +291,7 @@ class LlamaDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return hidden_states, residual
 
 
@@ -447,6 +467,11 @@ class LlamaForCausalLM(nn.Module):
         ]
 
         self.capture_aux_hidden_states = False
+
+    def configure_prefill_mlp_chunking(self, tokens):
+        assert tokens >= 0
+        for index in range(self.start_layer, self.end_layer):
+            self.model.layers[index].mlp.prefill_chunk_tokens = tokens
 
     def _init_model(
         self,
