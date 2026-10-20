@@ -18,8 +18,8 @@
         "MC_TCP_PROGRESS_TIMEOUT_SEC": "120",
         "SGLANG_DISAGGREGATION_QUEUE_SIZE": "1",
         "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE": "4",
-        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
-        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "600",
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "3600",
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "3600",
         "GLOG_v": "1"
       }
     },
@@ -31,5 +31,6 @@
         "UCX_LOG_LEVEL": "info"
       }
     }
-  }
+  },
+  "timeout_rationale": "The 300-request trace preflight demonstrates a sustained arrival/service-rate mismatch. Align PD bootstrap/wait deadlines with the unchanged 3600-second client budget so CPU-staged transfer queueing is not mistaken for peer death."
 }
