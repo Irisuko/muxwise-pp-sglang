@@ -102,6 +102,26 @@
         "UCX_POSIX_SEG_SIZE": "1M",
         "UCX_SYSV_SEG_SIZE": "1M"
       }
+    },
+    "mooncake-8m": {
+      "backend": "mooncake",
+      "env": {
+        "MC_FORCE_TCP": "1",
+        "MC_TCP_ENABLE_CONNECTION_POOL": "1",
+        "MC_TCP_LANES_PER_PEER": "8",
+        "MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER": "65535",
+        "MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER": "65535",
+        "MC_TCP_ADMISSION_TIMEOUT_MS": "60000",
+        "MC_TCP_SLICE_SIZE": "8388608",
+        "MC_TRANSFER_TIMEOUT": "300",
+        "MC_TCP_STATUS_TIMEOUT_SEC": "120",
+        "MC_TCP_PROGRESS_TIMEOUT_SEC": "120",
+        "SGLANG_DISAGGREGATION_QUEUE_SIZE": "4",
+        "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE": "4",
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "3600",
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "3600",
+        "GLOG_v": "1"
+      }
     }
   }
 }
