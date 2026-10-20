@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "inference_baseline": "bd849d628cd6332defee24945ce71db3fa662f90",
+  "purpose": "P4a 4xRTX4090 without P2P or RDMA; 2P2D TP1. Validate all correctness/long/300-request gates before the single sglang_pd_r2 replay.",
+  "profiles": {
+    "mooncake-tuned": {
+      "backend": "mooncake",
+      "env": {
+        "MC_FORCE_TCP": "1",
+        "MC_TCP_ENABLE_CONNECTION_POOL": "1",
+        "MC_TCP_LANES_PER_PEER": "8",
+        "MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER": "65535",
+        "MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER": "65535",
+        "MC_TCP_ADMISSION_TIMEOUT_MS": "60000",
+        "MC_TCP_SLICE_SIZE": "1048576",
+        "MC_TRANSFER_TIMEOUT": "300",
+        "MC_TCP_STATUS_TIMEOUT_SEC": "120",
+        "MC_TCP_PROGRESS_TIMEOUT_SEC": "120",
+        "SGLANG_DISAGGREGATION_QUEUE_SIZE": "1",
+        "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE": "4",
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "600",
+        "GLOG_v": "1"
+      }
+    },
+    "nixl-host": {
+      "backend": "nixl",
+      "env": {
+        "UCX_TLS": "cuda_copy,tcp,sm,self",
+        "UCX_NET_DEVICES": "lo",
+        "UCX_LOG_LEVEL": "info"
+      }
+    }
+  }
+}
