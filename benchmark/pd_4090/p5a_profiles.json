@@ -49,6 +49,20 @@
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "3600",
         "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "3600"
       }
+    },
+    "nixl-sm-1m": {
+      "backend": "nixl",
+      "env": {
+        "UCX_TLS": "cuda_copy,sm,self",
+        "UCX_NET_DEVICES": "lo",
+        "UCX_LOG_LEVEL": "info",
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "3600",
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "3600",
+        "UCX_POSIX_SEG_SIZE": "1M",
+        "UCX_SYSV_SEG_SIZE": "1M",
+        "UCX_TCP_TX_SEG_SIZE": "1M",
+        "UCX_TCP_RX_SEG_SIZE": "1M"
+      }
     }
   }
 }
