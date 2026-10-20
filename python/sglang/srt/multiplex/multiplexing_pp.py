@@ -1100,6 +1100,12 @@ class SchedulerMultiplexPPMixin:
                 else None
             ),
             by_partition=[row.copy() for row in self._pp_models.samples_by_partition],
+            cuda_memory=dict(
+                allocated=torch.cuda.memory_allocated(),
+                reserved=torch.cuda.memory_reserved(),
+                max_allocated=torch.cuda.max_memory_allocated(),
+                max_reserved=torch.cuda.max_memory_reserved(),
+            ),
             timing=self._pp_timing.snapshot(),
             admission=(
                 self._pp_admission_stats.snapshot() if self.pp_rank == 0 else None
