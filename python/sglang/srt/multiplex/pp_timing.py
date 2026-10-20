@@ -19,6 +19,13 @@ class LaneTimings:
             if trace
             else None
         )
+        rounds = os.getenv("SGLANG_PDMUX_PP_ROUND_TRACE")
+        self.round_trace = (
+            open(rounds, "w", buffering=1)
+            if rounds and scheduler.pp_rank == 0
+            else None
+        )
+        self.round_previous = {}
         self.started = time.monotonic()
         self.phase = {"prefill": "empty", "decode": "control"}
         self.since = {lane: self.started for lane in self.phase}
@@ -28,6 +35,28 @@ class LaneTimings:
         self.partitions = defaultdict(float)
         self.partition_since = self.started
         self.partition = 0
+
+    def decode_launch(self, mb, batch):
+        if self.round_trace is None:
+            return
+        now = time.monotonic()
+        ids = tuple(r.rid for r in batch.reqs)
+        previous = self.round_previous.get(mb)
+        if previous and ids == previous[1]:
+            self.round_trace.write(
+                json.dumps(
+                    dict(
+                        at=time.time(),
+                        mb=mb,
+                        bs=len(ids),
+                        ctx=previous[2],
+                        partition=previous[3],
+                        seconds=now - previous[0],
+                    )
+                )
+                + "\n"
+            )
+        self.round_previous[mb] = (now, ids, batch.seq_lens_sum, self.s._pp_stream_idx)
 
     def mark(self, lane, phase):
         now = time.monotonic()

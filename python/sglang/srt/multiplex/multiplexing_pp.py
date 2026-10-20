@@ -83,6 +83,8 @@ class PPControl:
     required: float = 0.0
     waiting_tokens: int = 0
     admission_budget: int = 0
+    decode_bs: int = 0
+    retired: Optional[dict] = None
 
 
 class StaticMuxPPPolicy:
@@ -482,6 +484,20 @@ class SchedulerMultiplexPPMixin:
                 )
                 / 2**20,
             )
+        self._pp_decode_transport = None
+        if self.pdmux_config.pp_async_decode:
+            from sglang.srt.multiplex.pp_decode import AsyncDecodeTransport
+
+            max_bs = self.server_args.max_micro_batch_size or max(
+                1, self.max_running_requests // self.pp_size
+            )
+            self._pp_decode_transport = AsyncDecodeTransport(
+                self.pp_group,
+                max_bs,
+                self.model_config.hidden_size,
+                self.model_config.dtype,
+                self.device,
+            )
         logger.info(
             "MuxWise-PP stage=%s layers=[%s,%s) capacity=%s partitions=%s radix=%s graphs=%s",
             self.pp_rank,
@@ -848,7 +864,18 @@ class SchedulerMultiplexPPMixin:
         assert merge["target_mb"] == mb_id
         batch = work.batch
         assert batch.split_prefill_finished
+        # The last-stage result can outrun local polling of a completed send.
+        # Do not delete its receive-slot owner before recording the reuse fence.
+        if work.launched is not None:
+            while not work.launched.wait(timeout=0.1):
+                if not self.prefill_mailbox.errors.empty():
+                    raise RuntimeError(
+                        "Prefill send failed before MERGE"
+                    ) from self.prefill_mailbox.errors.get()
         self._pp_decode_stream.wait_event(work.event)
+        if work.recv_slot is not None:
+            self._pp_receive_stream.wait_event(work.event)
+            self._pp_release_receive(work)
         batch.output_ids = torch.tensor(
             merge["next_token_ids"], device=self.device, dtype=torch.int64
         )
@@ -1170,6 +1197,8 @@ class SchedulerMultiplexPPMixin:
         self._pp_init()
         in_flight = [None] * self.pp_size
         pp_outputs = None
+        transport = self._pp_decode_transport
+        flight_steps = [None] * self.pp_size
         step = 0
         try:
             while True:
@@ -1185,6 +1214,15 @@ class SchedulerMultiplexPPMixin:
                         if self.pp_rank == 0:
                             requests = self.recv_requests()
                             packet = PPControl(step, mb_id, requests=requests)
+                            if transport and in_flight[mb_id] is not None:
+                                self._pp_timing.mark("decode", "token")
+                                packet.retired = transport.receive_tokens(
+                                    flight_steps[mb_id], mb_id
+                                )
+                        elif transport:
+                            self._pp_timing.mark("decode", "control_recv")
+                            packet, proxy_receive = transport.receive_control()
+                            assert (packet.step, packet.mb_id) == (step, mb_id)
                         else:
                             obj = [None]
                             self._pp_timing.mark("decode", "control_recv")
@@ -1196,6 +1234,34 @@ class SchedulerMultiplexPPMixin:
                             self._pp_timing.mark("decode", "control")
                             packet = obj[0]
                             assert (packet.step, packet.mb_id) == (step, mb_id)
+                        if transport:
+                            transport.check()
+                            if packet.retired is not None:
+                                self._pp_timing.mark("decode", "retire")
+                                retired = packet.retired
+                                assert (retired["step"], retired["mb_id"]) == (
+                                    flight_steps[mb_id],
+                                    mb_id,
+                                )
+                                batch = in_flight[mb_id]
+                                assert (
+                                    batch is not None
+                                    and len(retired["tokens"]) == batch.batch_size()
+                                )
+                                cpu_ids = torch.tensor(
+                                    retired["tokens"], dtype=torch.int64
+                                )
+                                batch.output_ids = cpu_ids.to(
+                                    self.device, non_blocking=True
+                                )
+                                self.process_batch_result(
+                                    batch,
+                                    self._pp_result(
+                                        cpu_ids, retired["can_run_cuda_graph"]
+                                    ),
+                                )
+                                in_flight[mb_id] = None
+                            self._pp_timing.mark("decode", "control")
                         self._pp_eviction.begin(packet.evictions)
                         # Abort decisions include all microbatches and in-flight prefill.
                         self.process_input_requests(
@@ -1248,6 +1314,19 @@ class SchedulerMultiplexPPMixin:
                         self.running_mbs[mb_id] = self.running_batch
                         in_flight[mb_id] = self.cur_batch
                         self._pp_eviction.end()
+                        if transport:
+                            flight_steps[mb_id] = step if self.cur_batch else None
+                            bs = self.cur_batch.batch_size() if self.cur_batch else 0
+                            if self.pp_rank == 0:
+                                packet.decode_bs = bs
+                            else:
+                                assert (
+                                    packet.decode_bs == bs
+                                ), "PP decode batch divergence"
+                            if not self.pp_group.is_last_rank:
+                                # Includes proxy shape and retired tokens; prefetch on
+                                # the next stage while this stage computes.
+                                transport.send_control(packet)
                     with torch.cuda.stream(self._pp_prefill_stream):
                         set_pdmux_status(True)
                         self._pp_timing.mark("decode", "prefill_launch")
@@ -1262,54 +1341,81 @@ class SchedulerMultiplexPPMixin:
                             "decode", "empty" if not self.cur_batch else "launch"
                         )
                         if self.cur_batch:
-                            result = self.run_batch(self.cur_batch)
+                            self._pp_timing.decode_launch(mb_id, self.cur_batch)
+                            proxy = None
+                            if transport and self.pp_rank:
+                                self._pp_timing.mark("decode", "proxy")
+                                proxy_receive.wait()
+                                proxy = PPProxyTensors(proxy_receive.payload)
+                            result = self.run_batch(
+                                self.cur_batch, pp_proxy_tensors=proxy
+                            )
                             self._pp_decode_steps += 1
-                        # This is the upstream PP ring: retire the next microbatch,
-                        # relay the previous token result, then send controls/proxy.
-                        self._pp_timing.mark("decode", "send")
-                        if self.pp_group.is_last_rank and self.cur_batch:
-                            pp_outputs = {
-                                "next_token_ids": result.next_token_ids,
-                                "can_run_cuda_graph": result.can_run_cuda_graph,
-                            }
-                            self.pp_group.send_tensor_dict(
-                                pp_outputs, all_gather_group=self.attn_tp_group
-                            )
-                        next_mb = (mb_id + 1) % self.pp_size
-                        next_outputs = None
-                        if in_flight[next_mb] is not None:
-                            self._pp_timing.mark("decode", "token")
-                            next_outputs = self.pp_group.recv_tensor_dict(
-                                all_gather_group=self.attn_tp_group
-                            )
-                            self._pp_timing.mark("decode", "retire")
-                            batch = in_flight[next_mb]
-                            batch.output_ids = next_outputs["next_token_ids"]
-                            self.process_batch_result(
-                                batch,
-                                self._pp_result(
-                                    batch.output_ids,
-                                    next_outputs["can_run_cuda_graph"],
-                                ),
-                            )
-                            in_flight[next_mb] = None
-                        self._pp_timing.mark("decode", "send")
-                        if not self.pp_group.is_last_rank:
-                            if pp_outputs is not None:
+                        if transport:
+                            self._pp_timing.mark("decode", "send")
+                            if self.cur_batch:
+                                if self.pp_group.is_last_rank:
+                                    transport.send_tokens(
+                                        step,
+                                        mb_id,
+                                        result.next_token_ids,
+                                        result.can_run_cuda_graph,
+                                    )
+                                else:
+                                    transport.send_proxy(
+                                        mb_id, result.pp_hidden_states_proxy_tensors
+                                    )
+                                if self.pp_rank:
+                                    # Residual may alias the receive slot; include
+                                    # the owned send copy in its consumption fence.
+                                    transport.release_proxy(mb_id)
+                        else:
+                            # This is the upstream PP ring: retire the next microbatch,
+                            # relay the previous token result, then send controls/proxy.
+                            self._pp_timing.mark("decode", "send")
+                            if self.pp_group.is_last_rank and self.cur_batch:
+                                pp_outputs = {
+                                    "next_token_ids": result.next_token_ids,
+                                    "can_run_cuda_graph": result.can_run_cuda_graph,
+                                }
                                 self.pp_group.send_tensor_dict(
                                     pp_outputs, all_gather_group=self.attn_tp_group
                                 )
-                            dist.send_object_list(
-                                [packet],
-                                dst=self.pp_group.ranks[self.pp_rank + 1],
-                                group=self.world_group.cpu_group,
-                            )
-                            if self.cur_batch:
-                                self.pp_group.send_tensor_dict(
-                                    result.pp_hidden_states_proxy_tensors,
-                                    all_gather_group=self.attn_tp_group,
+                            next_mb = (mb_id + 1) % self.pp_size
+                            next_outputs = None
+                            if in_flight[next_mb] is not None:
+                                self._pp_timing.mark("decode", "token")
+                                next_outputs = self.pp_group.recv_tensor_dict(
+                                    all_gather_group=self.attn_tp_group
                                 )
-                        pp_outputs = next_outputs
+                                self._pp_timing.mark("decode", "retire")
+                                batch = in_flight[next_mb]
+                                batch.output_ids = next_outputs["next_token_ids"]
+                                self.process_batch_result(
+                                    batch,
+                                    self._pp_result(
+                                        batch.output_ids,
+                                        next_outputs["can_run_cuda_graph"],
+                                    ),
+                                )
+                                in_flight[next_mb] = None
+                            self._pp_timing.mark("decode", "send")
+                            if not self.pp_group.is_last_rank:
+                                if pp_outputs is not None:
+                                    self.pp_group.send_tensor_dict(
+                                        pp_outputs, all_gather_group=self.attn_tp_group
+                                    )
+                                dist.send_object_list(
+                                    [packet],
+                                    dst=self.pp_group.ranks[self.pp_rank + 1],
+                                    group=self.world_group.cpu_group,
+                                )
+                                if self.cur_batch:
+                                    self.pp_group.send_tensor_dict(
+                                        result.pp_hidden_states_proxy_tensors,
+                                        all_gather_group=self.attn_tp_group,
+                                    )
+                            pp_outputs = next_outputs
                     self._pp_timing.mark("decode", "control")
                     self._pp_summary()
                     step += 1
@@ -1353,5 +1459,7 @@ class SchedulerMultiplexPPMixin:
                 else:
                     self._pp_idle_logged = False
         finally:
+            if transport:
+                transport.close()
             self.prefill_mailbox.outbox.put(None)
             self.prefill_mailbox.transfers.put(None)

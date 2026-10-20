@@ -1,0 +1,14 @@
+# 4090 PP4: endpoints 128/0, 0/128; every mixed lane >=4 SM, multiples of 2.
+sm_group_num: 8
+manual_divisions:
+  - [120, 8, 1]
+  - [112, 16, 4]
+  - [104, 24, 8]
+  - [96, 32, 12]
+  - [80, 48, 16]
+  - [64, 64, 24]
+decode_bs_divisor: 24
+split_forward_token_budget: 65536
+pp_profile_decode: true
+pp_prefetch: true
+pp_async_decode: true

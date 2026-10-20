@@ -14,6 +14,7 @@ from sglang.srt.multiplex.multiplexing_pp import (
     DeterministicRadixFIFO,
     OrderedRadixEviction,
     PrefillMailbox,
+    PrefillPlan,
     PrefillReceivePool,
     PrefillWork,
     SchedulerMultiplexPPMixin,
@@ -121,6 +122,40 @@ class TestProtocol(unittest.TestCase):
             pool.release(first)
         pool.release(reused)
         self.assertEqual(len(pool.free), 2)
+
+    def test_merge_releases_slot_even_before_send_polling(self):
+        s = SchedulerMultiplexPPMixin()
+        s.device, s.pp_rank = "cpu", 1
+        waits = []
+        s._pp_decode_stream = SimpleNamespace(
+            wait_event=lambda e: waits.append(("decode", e))
+        )
+        s._pp_receive_stream = SimpleNamespace(
+            wait_event=lambda e: waits.append(("receive", e))
+        )
+        s._pp_receive_pool = PrefillReceivePool(8, 4, torch.float32, "cpu")
+        slot, _ = s._pp_receive_pool.acquire(
+            [(k, (4, 4), torch.float32) for k in ("hidden_states", "residual")]
+        )
+        batch = SimpleNamespace(
+            split_prefill_finished=True,
+            filter_batch=lambda: None,
+            is_empty=lambda: True,
+        )
+        event, launched = object(), threading.Event()
+        launched.set()
+        work = PrefillWork(
+            PrefillPlan(7, [], ["r"]), batch, "sending", event, launched, recv_slot=slot
+        )
+        s._pp_prefills = {7: work}
+        s._pp_pending_merges, s.pp_size = [[], []], 2
+        s.split_prefill_batch = batch
+        s.process_batch_result = lambda batch, result: None
+        s._pp_merge(dict(batch_id=7, target_mb=0, next_token_ids=[9], targets=[0]), 0)
+        self.assertEqual(waits, [("decode", event), ("receive", event)])
+        self.assertEqual(len(s._pp_receive_pool.free), 2)
+        self.assertIsNone(work.recv_slot)
+        self.assertEqual(s._pp_prefills, {})
 
     def test_abort_covers_all_lanes_and_emits_terminal_output(self):
         scheduler = SchedulerMultiplexPPMixin()

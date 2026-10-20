@@ -2035,15 +2035,30 @@ class Scheduler(
                     )
                 bid = model_worker_batch.bid
             elif self.spec_algorithm.is_none():
-                model_worker_batch = batch.get_model_worker_batch()
+                seq_lens_cpu = None
+                if getattr(self, "_pp_decode_transport", None) is not None:
+                    # Ordered retirement keeps CPU Req lengths exact. Avoid the
+                    # per-step seq_lens.cpu() synchronization before PP forward.
+                    seq_lens_cpu = torch.tensor(
+                        [
+                            len(r.origin_input_ids) + len(r.output_ids)
+                            for r in batch.reqs
+                        ],
+                        dtype=torch.int64,
+                    )
+                model_worker_batch = batch.get_model_worker_batch(seq_lens_cpu)
 
                 if self.pp_group.is_last_rank:
                     logits_output, next_token_ids, can_run_cuda_graph = (
-                        self.tp_worker.forward_batch_generation(model_worker_batch)
+                        self.tp_worker.forward_batch_generation(
+                            model_worker_batch, pp_proxy_tensors=pp_proxy_tensors
+                        )
                     )
                 else:
                     pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
-                        self.tp_worker.forward_batch_generation(model_worker_batch)
+                        self.tp_worker.forward_batch_generation(
+                            model_worker_batch, pp_proxy_tensors=pp_proxy_tensors
+                        )
                     )
                 bid = model_worker_batch.bid
             else:

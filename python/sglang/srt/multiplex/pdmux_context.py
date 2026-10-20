@@ -22,6 +22,7 @@ class PDMuxConfig:
     decode_bs_divisor: int = 36
     pp_profile_decode: bool = False
     pp_prefetch: bool = False
+    pp_async_decode: bool = False
 
 
 def load_pdmux_config(config_path: str) -> PDMuxConfig:
@@ -54,6 +55,7 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         decode_bs_divisor=raw.get("decode_bs_divisor", 36),
         pp_profile_decode=raw.get("pp_profile_decode", False),
         pp_prefetch=raw.get("pp_prefetch", False),
+        pp_async_decode=raw.get("pp_async_decode", False),
     )
 
 

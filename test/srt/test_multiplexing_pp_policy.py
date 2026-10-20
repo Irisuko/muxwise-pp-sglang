@@ -217,6 +217,7 @@ class TestAdmission(unittest.TestCase):
         admitted = []
         s._pp_build_prefill = lambda plan, reqs: admitted.extend(reqs)
         self.assertEqual(s._pp_make_plan().rids, [])
+        self.assertEqual(s._pp_admission_stats.blocked, {"decode_reserve": 1})
         s.server_args.pdmux_pp_reserve_decode = False
         self.assertEqual(s._pp_make_plan().rids, [new.rid])
         self.assertEqual(admitted, [new])

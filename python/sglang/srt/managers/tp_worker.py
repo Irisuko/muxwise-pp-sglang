@@ -239,6 +239,7 @@ class TpModelWorker:
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Tuple[
         Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
     ]:
@@ -248,8 +249,7 @@ class TpModelWorker:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         timer = getattr(self, "pdmux_pp_timing", None)
-        pp_proxy_tensors = None
-        if not self.pp_group.is_first_rank:
+        if not self.pp_group.is_first_rank and pp_proxy_tensors is None:
             if timer:
                 timer.mark("decode", "proxy")
             pp_proxy_tensors = PPProxyTensors(
