@@ -209,6 +209,11 @@ class TestAdmission(unittest.TestCase):
         )
         s.token_to_kv_pool_allocator = SimpleNamespace(available_size=lambda: 6000)
         s.req_to_token_pool = SimpleNamespace(available_size=lambda: 127)
+        from sglang.srt.multiplex.pp_admission import AdmissionStats
+
+        s.max_total_num_tokens = 6000
+        s._pp_prefills[0].batch.extend_num_tokens = 2000
+        s._pp_admission_stats = AdmissionStats(s)
         admitted = []
         s._pp_build_prefill = lambda plan, reqs: admitted.extend(reqs)
         self.assertEqual(s._pp_make_plan().rids, [])

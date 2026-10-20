@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.evict_policy import LRUStrategy
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.pdmux_context import set_current_stream_idx
+from sglang.srt.multiplex.pp_admission import AdmissionStats
 from sglang.srt.multiplex.pp_policy import (
     ALPMuxPPPolicy,
     balanced_assignment,
@@ -451,6 +452,7 @@ class SchedulerMultiplexPPMixin:
         self._pp_max_prefills = (
             self.server_args.pdmux_pp_max_inflight_prefill or self.pp_size
         )
+        self._pp_admission_stats = AdmissionStats(self)
         self._pp_stream_idx = 0
         self._pp_idle_logged = False
         self._pp_prefill_steps = 0
@@ -538,10 +540,16 @@ class SchedulerMultiplexPPMixin:
         )
 
     def _pp_make_plan(self):
-        if len(self._pp_prefills) >= self._pp_max_prefills or not self.waiting_queue:
+        stats = self._pp_admission_stats
+        if not self.waiting_queue:
+            stats.record("empty")
+            return None
+        if len(self._pp_prefills) >= self._pp_max_prefills:
+            stats.record("inflight")
             return None
         budget = self._pp_admission_budget
         if budget <= 0:
+            stats.record("budget", budget=budget)
             return None
         # Reserve the entire remaining output, across ALL microbatches, plus
         # pp_size-1 safety tokens. Unmerged and ready-to-join requests count too.
@@ -574,8 +582,10 @@ class SchedulerMultiplexPPMixin:
         slots = min(self.req_to_token_pool.available_size(), free_mb_slots)
         selected, probes = [], []
         input_tokens = 0
+        reason, details = "admitted", dict(reserve=reserve, budget=budget)
         for req in self.waiting_queue:
             if len(selected) >= slots:
+                reason = "max_running_requests"
                 break
             req.init_next_round_input(self.tree_cache)
             probes.append((req.rid, len(req.fill_ids), len(req.prefix_indices)))
@@ -591,11 +601,23 @@ class SchedulerMultiplexPPMixin:
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.evictable_size()
             )
-            if reserve + needed >= available or (
-                selected and input_tokens + req.extend_input_len > budget
+            reason = stats.capacity_reason(available, needed, reserve)
+            if (
+                reason is None
+                and selected
+                and input_tokens + req.extend_input_len > budget
             ):
+                reason = "budget"
+            if reason:
+                details.update(
+                    available_after_lock=available,
+                    needed=needed,
+                    reserve=reserve,
+                    prefix=len(req.prefix_indices),
+                )
                 self.tree_cache.dec_lock_ref(req.last_node)
                 break
+            reason = "admitted"
             selected.append(req)
             reserve += needed
             input_tokens += req.extend_input_len
@@ -603,6 +625,7 @@ class SchedulerMultiplexPPMixin:
         if selected:
             self._pp_batch_id += 1
             self._pp_build_prefill(plan, selected)
+        stats.record(reason, len(selected), **details)
         return plan  # Failed probes also have to be replayed.
 
     def _pp_apply_plan(self, plan):
@@ -1051,6 +1074,9 @@ class SchedulerMultiplexPPMixin:
             ),
             by_partition=[row.copy() for row in self._pp_models.samples_by_partition],
             timing=self._pp_timing.snapshot(),
+            admission=(
+                self._pp_admission_stats.snapshot() if self.pp_rank == 0 else None
+            ),
             at=now,
         )
         if self.pp_rank:
@@ -1059,6 +1085,15 @@ class SchedulerMultiplexPPMixin:
                 dict(kind="status", stage=self.pp_rank, data=data)
             )
             return
+        if (
+            0 in self._pp_stage_status
+            and now - self._pp_stage_status[0]["at"]
+            < self.server_args.pdmux_pp_summary_interval
+        ):
+            data["admission"]["series"] = (
+                self._pp_stage_status[0]["admission"]["series"]
+                + data["admission"]["series"]
+            )
         self._pp_stage_status[0] = data
         # Give downstream reports a control turn to arrive before logging;
         # include all stages from this reporting interval, not the previous one.
