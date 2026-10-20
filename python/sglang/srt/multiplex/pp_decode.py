@@ -42,9 +42,13 @@ class AsyncDecodeTransport:
         # new transport thread would otherwise select GPU0 on every PP rank.
         self.device, self.max_bs = getattr(group, "device", device), max_bs
         self.errors = queue.Queue()
-        self.controls_in, self.controls_out = queue.Queue(), queue.Queue()
-        self.tokens_in, self.tokens_out = queue.Queue(), queue.Queue()
-        self.sends = queue.Queue()
+        # Empty control turns have no token-ring backpressure. Bound them too,
+        # so idle traffic cannot build a backlog ahead of newly arrived work.
+        self.controls_in, self.controls_out = queue.Queue(self.size), queue.Queue(
+            self.size
+        )
+        self.tokens_in, self.tokens_out = queue.Queue(self.size), queue.Queue(self.size)
+        self.sends = queue.Queue(self.size)
         self.rx_stream, self.tx_stream = torch.cuda.Stream(), torch.cuda.Stream()
         self.rx_slots, self.tx_slots = [], []
         self.rx_free, self.rx_consumed = [], [None] * self.size
@@ -109,9 +113,20 @@ class AsyncDecodeTransport:
             except queue.Empty:
                 pass
 
+    def _put(self, outbox, value):
+        while True:
+            self.check()
+            try:
+                outbox.put(value, timeout=0.1)
+                return
+            except queue.Full:
+                pass
+
     def send_control(self, packet):
         # Freeze mutable Req/control state on the scheduler before handing it off.
-        self.controls_out.put(pickle.dumps(packet, protocol=pickle.HIGHEST_PROTOCOL))
+        self._put(
+            self.controls_out, pickle.dumps(packet, protocol=pickle.HIGHEST_PROTOCOL)
+        )
 
     def _send_controls(self):
         while (payload := self.controls_out.get()) is not None:
@@ -167,7 +182,7 @@ class AsyncDecodeTransport:
             dest.copy_(tensors[key])
         ready = torch.cuda.current_stream().record_event()
         transfer = self.tx_work[mb] = P2PWork(payload)
-        self.sends.put((transfer, ready))
+        self._put(self.sends, (transfer, ready))
 
     def _send_proxies(self):
         while (job := self.sends.get()) is not None:
@@ -192,7 +207,7 @@ class AsyncDecodeTransport:
         bs = tokens.numel()
         self.token_slots[mb][:bs].copy_(tokens, non_blocking=True)
         ready = torch.cuda.current_stream().record_event()
-        self.tokens_out.put((step, mb, bs, can_run_cuda_graph, ready))
+        self._put(self.tokens_out, (step, mb, bs, can_run_cuda_graph, ready))
 
     def _send_tokens(self):
         while (job := self.tokens_out.get()) is not None:
@@ -226,6 +241,8 @@ class AsyncDecodeTransport:
         return packet
 
     def close(self):
-        self.controls_out.put(None)
-        self.sends.put(None)
-        self.tokens_out.put(None)
+        for outbox in (self.controls_out, self.sends, self.tokens_out):
+            try:
+                outbox.put_nowait(None)
+            except queue.Full:
+                pass  # Never block exception cleanup on a failed peer/thread.
