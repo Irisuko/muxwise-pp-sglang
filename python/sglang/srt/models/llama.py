@@ -107,6 +107,9 @@ class LlamaMLP(nn.Module):
         ):
             # MLP rows are independent. Only the wide gate/up and activation
             # intermediates are bounded; attention still sees the whole batch.
+            # TP peers have identical rows/limit under the ordered PP controls.
+            # Each chunk executes one RowParallel all-reduce on the prefill TP
+            # communicator (never the concurrently active decode communicator).
             output = torch.empty_like(x)
             for start in range(0, x.shape[0], limit):
                 end = min(start + limit, x.shape[0])

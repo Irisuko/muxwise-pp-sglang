@@ -411,7 +411,9 @@ class SchedulerMultiplexPPMixin:
         )
 
     def _pp_init(self):
-        assert self.tp_size == 1, "MuxWise-PP supports TP=1"
+        # Only this rank may decide request/cache transitions. Stage0 TP peers
+        # replay its complete journal before forwarding along their PP pair.
+        self._pp_leader = self.pp_rank == 0 and self.tp_rank == 0
         assert (
             self.model_config.hf_config.model_type == "llama"
         ), "MuxWise-PP supports Llama"
@@ -423,7 +425,7 @@ class SchedulerMultiplexPPMixin:
             if self.server_args.pdmux_pp_radix_eviction == "fifo"
             else LRUStrategy()
         )
-        self._pp_eviction = OrderedRadixEviction(self.tree_cache, self.pp_rank == 0)
+        self._pp_eviction = OrderedRadixEviction(self.tree_cache, self._pp_leader)
         self._pp_models = ALPMuxPPPolicy(self, StaticMuxPPPolicy())
         self.mux_pp_policy = (
             self._pp_models
@@ -485,7 +487,9 @@ class SchedulerMultiplexPPMixin:
                 / 2**20,
             )
         self._pp_decode_transport = None
-        if self.pdmux_config.pp_async_decode:
+        # TP uses the token-to-control protocol even with a legacy config.
+        # TP1 retains its configured transport without extra collectives.
+        if self.pdmux_config.pp_async_decode or self.tp_size > 1:
             from sglang.srt.multiplex.pp_decode import AsyncDecodeTransport
 
             max_bs = self.server_args.max_micro_batch_size or max(
@@ -497,6 +501,7 @@ class SchedulerMultiplexPPMixin:
                 self.model_config.hidden_size,
                 self.model_config.dtype,
                 self.device,
+                token_leader=self.tp_rank == 0,
             )
         logger.info(
             "MuxWise-PP stage=%s layers=[%s,%s) capacity=%s partitions=%s radix=%s graphs=%s",
@@ -517,6 +522,22 @@ class SchedulerMultiplexPPMixin:
             ),
         )
 
+    def _pp_tp_broadcast(self, value):
+        if self.tp_size == 1:
+            return value
+        obj = [value]
+        dist.broadcast_object_list(
+            obj, src=self.tp_group.ranks[0], group=self.tp_cpu_group
+        )
+        return obj[0]
+
+    def _pp_tp_all(self, ready):
+        if self.tp_size == 1:
+            return ready
+        flag = torch.tensor([int(ready)], dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self.tp_cpu_group)
+        return bool(flag.item())
+
     def _pp_select_streams(self, idx):
         self._pp_models.last_switch = self._pp_decode_steps
         self._pp_stream_idx = idx
@@ -528,25 +549,32 @@ class SchedulerMultiplexPPMixin:
     def _pp_adjust_streams(self, decode_bs):
         if not decode_bs:
             decode_bs = max(mb.batch_size() for mb in self.running_mbs)
-        idx = self.mux_pp_policy.partition(
-            self.pdmux_config,
-            len(self.stream_groups),
-            decode_bs,
-            any(w.state != "done" for w in self._pp_prefills.values()),
-        )
+        idx = None
+        if self.tp_rank == 0:
+            idx = self.mux_pp_policy.partition(
+                self.pdmux_config,
+                len(self.stream_groups),
+                decode_bs,
+                any(w.state != "done" for w in self._pp_prefills.values()),
+            )
+        idx = self._pp_tp_broadcast(idx)
         if idx == self._pp_stream_idx:
             return
-        # An unmatched NCCL receive/send must never prevent decode progress.
-        for work in self._pp_prefills.values():
-            if work.launched is not None and not work.launched.is_set():
-                return
-            if work.event is not None and not work.event.query():
-                return
+        # All TP peers must have retired their local transfers before switching.
+        ready = all(
+            (w.launched is None or w.launched.is_set())
+            and (w.event is None or w.event.query())
+            for w in self._pp_prefills.values()
+        )
+        if not self._pp_tp_all(ready):
+            return
         with self._pp_timing.region("prefill", "switch"), self._pp_timing.region(
             "decode", "switch"
         ):
             self._pp_prefill_stream.synchronize()
             self._pp_decode_stream.synchronize()
+        if self.tp_size > 1:
+            dist.barrier(group=self.tp_cpu_group)
         self._pp_select_streams(idx)
         logger.debug(
             "MuxWise-PP partition=%s decode_bs=%s SMs=%s",
@@ -730,7 +758,9 @@ class SchedulerMultiplexPPMixin:
             if work.state != "waiting":
                 continue
             envelope = self._pp_envelopes.get(work.plan.batch_id)
-            if envelope is None or not self._pp_begin_receive(work, envelope):
+            if not self._pp_tp_all(envelope is not None):
+                break
+            if not self._pp_begin_receive(work, envelope):
                 break
             del self._pp_envelopes[work.plan.batch_id]
 
@@ -773,13 +803,13 @@ class SchedulerMultiplexPPMixin:
             return
         if work.state == "waiting":
             envelope = self._pp_envelopes.get(work.plan.batch_id)
-            if envelope is None:
+            if not self._pp_tp_all(envelope is not None):
                 return
             if not self._pp_begin_receive(work, envelope):
                 return
             del self._pp_envelopes[work.plan.batch_id]
         if work.state == "offering" and work.launched is None:
-            if work.plan.batch_id not in self.prefill_mailbox.ready:
+            if not self._pp_tp_all(work.plan.batch_id in self.prefill_mailbox.ready):
                 return
             self.prefill_mailbox.ready.remove(work.plan.batch_id)
             work.launched, work.event = self.prefill_mailbox.transfer(
@@ -787,12 +817,12 @@ class SchedulerMultiplexPPMixin:
             )
             work.state = "sending"
         if work.launched is not None:
-            if not work.launched.is_set():
+            if not self._pp_tp_all(work.launched.is_set()):
                 return
             work.launched = None
             if work.state == "offering":
                 work.state = "sending"
-        if work.event is not None and not work.event.query():
+        if not self._pp_tp_all(work.event is None or work.event.query()):
             return
         if work.state == "sending":
             work.state, work.proxy = "done", None
@@ -829,13 +859,14 @@ class SchedulerMultiplexPPMixin:
             work.event = self._pp_prefill_stream.record_event()
             return
         if self.pp_group.is_last_rank:
-            self.prefill_mailbox.outbox.put(
-                dict(
-                    kind="result",
-                    batch_id=work.plan.batch_id,
-                    tokens=work.tokens.tolist(),
+            if self.tp_rank == 0:
+                self.prefill_mailbox.outbox.put(
+                    dict(
+                        kind="result",
+                        batch_id=work.plan.batch_id,
+                        tokens=work.tokens.tolist(),
+                    )
                 )
-            )
             work.state = "done"
             work.batch.split_forward_batch = None
             self._pp_release_receive(work)
@@ -899,7 +930,7 @@ class SchedulerMultiplexPPMixin:
         del self._pp_prefills[merge["batch_id"]]
         if self.split_prefill_batch is batch:
             self.split_prefill_batch = None
-        if self.pp_rank == 0:
+        if self._pp_leader:
             assert self._pp_merge_ready.popleft()["batch_id"] == merge["batch_id"]
 
     def _pp_pending_requests(self):
@@ -1047,7 +1078,7 @@ class SchedulerMultiplexPPMixin:
     def _pp_update_demand(self, packet):
         args = self.server_args
         now = time.monotonic()
-        if self.pp_rank == 0:
+        if self._pp_leader:
             for r in self.waiting_queue:
                 if not hasattr(r, "_pp_arrival"):
                     r._pp_arrival = now
@@ -1085,6 +1116,8 @@ class SchedulerMultiplexPPMixin:
             )
 
     def _pp_summary(self):
+        if self.tp_rank != 0:
+            return
         now = time.monotonic()
         if now - self._pp_last_summary < self.server_args.pdmux_pp_summary_interval:
             return
@@ -1220,11 +1253,19 @@ class SchedulerMultiplexPPMixin:
                         if self.pp_rank == 0:
                             requests = self.recv_requests()
                             packet = PPControl(step, mb_id, requests=requests)
-                            if transport and in_flight[mb_id] is not None:
+                            if (
+                                transport
+                                and self.tp_rank == 0
+                                and in_flight[mb_id] is not None
+                            ):
                                 self._pp_timing.mark("decode", "token")
                                 packet.retired = transport.receive_tokens(
                                     flight_steps[mb_id], mb_id
                                 )
+                            # The leader publishes only after all allocator
+                            # operations have completed its eviction journal.
+                            if self.tp_rank != 0:
+                                packet = self._pp_tp_broadcast(None)
                         elif transport:
                             self._pp_timing.mark("decode", "control_recv")
                             packet, proxy_receive = transport.receive_control()
@@ -1240,6 +1281,7 @@ class SchedulerMultiplexPPMixin:
                             self._pp_timing.mark("decode", "control")
                             packet = obj[0]
                             assert (packet.step, packet.mb_id) == (step, mb_id)
+                        assert (packet.step, packet.mb_id) == (step, mb_id)
                         if transport:
                             transport.check()
                             if packet.retired is not None:
@@ -1273,11 +1315,11 @@ class SchedulerMultiplexPPMixin:
                         self.process_input_requests(
                             [r for r in packet.requests if not isinstance(r, AbortReq)]
                         )
-                        if self.pp_rank == 0:
+                        if self._pp_leader:
                             packet.abort = self._pp_abort_ids(packet.requests)
                         self._pp_apply_aborts(packet.abort)
                         assert in_flight[mb_id] is None
-                        if self.pp_rank == 0 and self._pp_merge_ready:
+                        if self._pp_leader and self._pp_merge_ready:
                             merge = self._pp_merge_ready[0]
                             if (
                                 self._pp_merge_targets(merge)
@@ -1287,18 +1329,18 @@ class SchedulerMultiplexPPMixin:
                         if packet.merge:
                             self._pp_merge(packet.merge, mb_id)
                         self._pp_join_pending(mb_id)
-                        if self.pp_rank == 0:
+                        if self._pp_leader:
                             self._pp_rebalance_control(packet, in_flight)
                         self._pp_apply_migrations(packet, in_flight)
                         self._pp_update_demand(packet)
-                        if self.pp_rank == 0:
+                        if self._pp_leader:
                             packet.plan = self._pp_make_plan()
                         elif packet.plan:
                             self._pp_apply_plan(packet.plan)
                         self.running_batch.filter_batch()
                         # Only stage zero decides retraction. Full output reservation
                         # normally makes this branch unnecessary; keep an explicit command.
-                        if self.pp_rank == 0 and not self.running_batch.is_empty():
+                        if self._pp_leader and not self.running_batch.is_empty():
                             available = (
                                 self.token_to_kv_pool_allocator.available_size()
                                 + self.tree_cache.evictable_size()
@@ -1320,10 +1362,16 @@ class SchedulerMultiplexPPMixin:
                         self.running_mbs[mb_id] = self.running_batch
                         in_flight[mb_id] = self.cur_batch
                         self._pp_eviction.end()
+                        if self._pp_leader:
+                            packet.decode_bs = (
+                                self.cur_batch.batch_size() if self.cur_batch else 0
+                            )
+                        if self._pp_leader and self.tp_size > 1:
+                            self._pp_tp_broadcast(packet)
                         if transport:
                             flight_steps[mb_id] = step if self.cur_batch else None
                             bs = self.cur_batch.batch_size() if self.cur_batch else 0
-                            if self.pp_rank == 0:
+                            if self._pp_leader:
                                 packet.decode_bs = bs
                             else:
                                 assert (
@@ -1360,14 +1408,14 @@ class SchedulerMultiplexPPMixin:
                         if transport:
                             self._pp_timing.mark("decode", "send")
                             if self.cur_batch:
-                                if self.pp_group.is_last_rank:
+                                if self.pp_group.is_last_rank and self.tp_rank == 0:
                                     transport.send_tokens(
                                         step,
                                         mb_id,
                                         result.next_token_ids,
                                         result.can_run_cuda_graph,
                                     )
-                                else:
+                                elif not self.pp_group.is_last_rank:
                                     transport.send_proxy(
                                         mb_id, result.pp_hidden_states_proxy_tensors
                                     )

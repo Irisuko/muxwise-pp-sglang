@@ -9,6 +9,7 @@ import logging
 import time
 
 import torch
+import torch.distributed as dist
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -89,12 +90,16 @@ def profile_decode(scheduler, max_seconds=55):
             records = []
             for bs in sizes:
                 for context in contexts:
-                    if time.monotonic() - started > max_seconds:
+                    if not scheduler._pp_tp_all(
+                        time.monotonic() - started <= max_seconds
+                    ):
                         raise RuntimeError(
                             "PP decode calibration exceeded startup time limit"
                         )
                     seconds = 0.0
                     for shape in context_shapes(bs, context, width):
+                        if scheduler.tp_size > 1:
+                            dist.barrier(group=scheduler.tp_cpu_group)
                         with torch.cuda.stream(stream):
                             graph.num_token_non_padded.fill_(bs)
                             cpu_lens = torch.tensor(shape, dtype=torch.int32)

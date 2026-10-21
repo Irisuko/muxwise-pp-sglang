@@ -16,13 +16,13 @@ class LaneTimings:
         trace = os.getenv("SGLANG_PDMUX_PP_TIMING_TRACE")
         self.trace = (
             open(f"{trace}.{scheduler.pp_rank}.jsonl", "w", buffering=1)
-            if trace
+            if trace and scheduler.tp_rank == 0
             else None
         )
         rounds = os.getenv("SGLANG_PDMUX_PP_ROUND_TRACE")
         self.round_trace = (
             open(rounds, "w", buffering=1)
-            if rounds and scheduler.pp_rank == 0
+            if rounds and scheduler.pp_rank == 0 and scheduler.tp_rank == 0
             else None
         )
         self.round_previous = {}

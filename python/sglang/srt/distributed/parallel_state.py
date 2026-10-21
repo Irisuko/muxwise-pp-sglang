@@ -1392,6 +1392,13 @@ def init_distributed_environment(
         ), "world group already initialized with a different world size"
 
 
+def pipeline_group_ranks(world_size: int, pipeline_size: int) -> list[list[int]]:
+    """Pair equal TP ranks across stages, for both decode and prefill lanes."""
+    assert world_size % pipeline_size == 0
+    stride = world_size // pipeline_size
+    return [list(range(i, world_size, stride)) for i in range(stride)]
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
@@ -1521,13 +1528,9 @@ def initialize_model_parallel(
         )
 
     # Build the pipeline model-parallel groups.
-    num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_pipeline_model_parallel_groups):
-        ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
-        group_ranks.append(ranks)
+    group_ranks = pipeline_group_ranks(world_size, pipeline_model_parallel_size)
     # pipeline parallel does not need custom allreduce
     _PP = init_model_parallel_group(
         group_ranks,

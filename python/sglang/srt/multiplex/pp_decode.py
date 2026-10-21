@@ -36,7 +36,7 @@ class P2PWork:
 
 
 class AsyncDecodeTransport:
-    def __init__(self, group, max_bs, hidden_size, dtype, device):
+    def __init__(self, group, max_bs, hidden_size, dtype, device, token_leader=True):
         self.group, self.rank, self.size = group, group.rank_in_group, group.world_size
         # CUDA device selection is thread-local; an unindexed "cuda" in a
         # new transport thread would otherwise select GPU0 on every PP rank.
@@ -81,8 +81,8 @@ class AsyncDecodeTransport:
             (self._receive_controls, self.rank > 0),
             (self._send_controls, self.rank < self.size - 1),
             (self._send_proxies, self.rank < self.size - 1),
-            (self._receive_tokens, self.rank == 0),
-            (self._send_tokens, self.rank == self.size - 1),
+            (self._receive_tokens, self.rank == 0 and token_leader),
+            (self._send_tokens, self.rank == self.size - 1 and token_leader),
         ):
             if enabled:
                 threading.Thread(target=self._guard, args=(fn,), daemon=True).start()

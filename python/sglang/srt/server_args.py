@@ -2914,13 +2914,12 @@ class ServerArgs:
         assert self.pdmux_prefill_mlp_chunk_tokens >= 0
         if self.pdmux_prefill_mlp_chunk_tokens:
             assert (
-                self.enable_pdmux and self.tp_size == 1
-            ), "Prefill MLP chunking requires pdmux with TP1"
+                self.enable_pdmux and not self.enable_dp_attention
+            ), "Prefill MLP chunking requires pdmux without DP attention"
         if self.pdmux_pp_max_inflight_prefill is not None:
             assert self.pdmux_pp_max_inflight_prefill > 0
         if self.enable_pdmux:
             if self.pp_size > 1:
-                assert self.tp_size == 1, "MuxWise-PP supports TP=1"
                 assert (
                     not self.enable_dp_attention
                 ), "MuxWise-PP does not support DP attention"
