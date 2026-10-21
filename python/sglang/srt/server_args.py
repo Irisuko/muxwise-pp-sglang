@@ -436,8 +436,8 @@ class ServerArgs:
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
     pdmux_prefill_mlp_chunk_tokens: int = 0
-    pdmux_pp_cpu_merge_tokens: bool = True
-    pdmux_pp_lazy_admission_budget: bool = True
+    pdmux_pp_cpu_merge_tokens: bool = False
+    pdmux_pp_lazy_admission_budget: bool = False
     pdmux_pp_adaptive_inflight: bool = False
     pdmux_pp_decode_aware_slices: bool = False
     pdmux_pp_runnable_partition: bool = False

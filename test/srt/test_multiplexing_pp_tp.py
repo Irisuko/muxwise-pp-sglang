@@ -175,8 +175,14 @@ def test_pp_optimization_defaults_and_independent_cli_ablations():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     args = parser.parse_args(["--model-path", "llama"])
-    enabled = ["latency_partition", "cpu_merge_tokens", "lazy_admission_budget"]
-    disabled = ["runnable_partition", "decode_aware_slices", "adaptive_inflight"]
+    enabled = ["latency_partition"]
+    disabled = [
+        "cpu_merge_tokens",
+        "lazy_admission_budget",
+        "runnable_partition",
+        "decode_aware_slices",
+        "adaptive_inflight",
+    ]
     for name in enabled:
         assert getattr(args, "pdmux_pp_" + name) is True
     for name in disabled:
