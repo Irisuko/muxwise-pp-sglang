@@ -166,3 +166,25 @@ def test_server_args_accept_tp_and_reject_dp_attention(monkeypatch):
     args.pdmux_prefill_mlp_chunk_tokens = 0
     with pytest.raises(AssertionError, match="DP attention"):
         args.check_server_args()
+
+
+def test_pp_optimization_defaults_and_independent_cli_ablations():
+    import argparse
+    from sglang.srt.server_args import ServerArgs
+
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    args = parser.parse_args(["--model-path", "llama"])
+    enabled = ["latency_partition", "cpu_merge_tokens", "lazy_admission_budget"]
+    disabled = ["runnable_partition", "decode_aware_slices", "adaptive_inflight"]
+    for name in enabled:
+        assert getattr(args, "pdmux_pp_" + name) is True
+    for name in disabled:
+        assert getattr(args, "pdmux_pp_" + name) is False
+    flags = ["--no-pdmux-pp-" + x.replace("_", "-") for x in enabled]
+    flags += ["--pdmux-pp-" + x.replace("_", "-") for x in disabled]
+    args = parser.parse_args(["--model-path", "llama"] + flags)
+    for name in enabled:
+        assert getattr(args, "pdmux_pp_" + name) is False
+    for name in disabled:
+        assert getattr(args, "pdmux_pp_" + name) is True

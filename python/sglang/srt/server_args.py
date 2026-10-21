@@ -436,9 +436,11 @@ class ServerArgs:
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
     pdmux_prefill_mlp_chunk_tokens: int = 0
-    pdmux_pp_adaptive_inflight: bool = True
-    pdmux_pp_decode_aware_slices: bool = True
-    pdmux_pp_runnable_partition: bool = True
+    pdmux_pp_cpu_merge_tokens: bool = True
+    pdmux_pp_lazy_admission_budget: bool = True
+    pdmux_pp_adaptive_inflight: bool = False
+    pdmux_pp_decode_aware_slices: bool = False
+    pdmux_pp_runnable_partition: bool = False
     pdmux_pp_latency_partition: bool = True
     pdmux_pp_request_trace: Optional[str] = None
     pdmux_pp_policy: str = "alp"
@@ -2640,6 +2642,18 @@ class ServerArgs:
             type=int,
             default=0,
             help="Token rows per Llama split-prefill MLP call (TP1, PP1 or PP>1); 0 disables chunking.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-cpu-merge-tokens",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.pdmux_pp_cpu_merge_tokens,
+            help="Consume CPU first-token results at MERGE without a redundant GPU round trip.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-lazy-admission-budget",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.pdmux_pp_lazy_admission_budget,
+            help="Evaluate the admission model only when a queued request can use an inflight slot.",
         )
         parser.add_argument(
             "--pdmux-pp-adaptive-inflight",

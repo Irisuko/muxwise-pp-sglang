@@ -449,6 +449,7 @@ class SchedulerMultiplexPPMixin:
         self._pp_required = 0.0
         self._pp_waiting_tokens = 0
         self._pp_admission_budget = self.max_prefill_tokens
+        self._pp_budget_stats = dict(calls=0, skipped=0, seconds=0.0)
         self._pp_arrivals = deque()
         self._pp_pending_merges = [[] for _ in range(self.pp_size)]
         self._pp_hold = []
@@ -1023,10 +1024,18 @@ class SchedulerMultiplexPPMixin:
         if work.recv_slot is not None:
             self._pp_receive_stream.wait_event(work.event)
             self._pp_release_receive(work)
-        batch.output_ids = torch.tensor(
-            merge["next_token_ids"], device=self.device, dtype=torch.int64
-        )
-        self.process_batch_result(batch, self._pp_result(batch.output_ids))
+        if self.server_args.pdmux_pp_cpu_merge_tokens:
+            # The first tokens are already CPU control data. Like decode
+            # retirement, retain the GPU copy for future forward/split_batch,
+            # but process/cache/emit the CPU values at the same MERGE point.
+            cpu_ids = torch.tensor(merge["next_token_ids"], dtype=torch.int64)
+            batch.output_ids = cpu_ids.to(self.device, non_blocking=True)
+            self.process_batch_result(batch, self._pp_result(cpu_ids))
+        else:
+            batch.output_ids = torch.tensor(
+                merge["next_token_ids"], device=self.device, dtype=torch.int64
+            )
+            self.process_batch_result(batch, self._pp_result(batch.output_ids))
         batch.split_forward_batch = (
             None  # Release hidden/residual and attention metadata.
         )
@@ -1218,7 +1227,15 @@ class SchedulerMultiplexPPMixin:
                 args.pdmux_pp_arrival_window,
             )
             self._pp_waiting_tokens = sum(n for _, n in waiting)
-            self._pp_admission_budget = self.mux_pp_policy.admission_budget(self)
+            if not args.pdmux_pp_lazy_admission_budget or (
+                self.waiting_queue and len(self._pp_prefills) < self._pp_max_prefills
+            ):
+                started = time.monotonic()
+                self._pp_admission_budget = self.mux_pp_policy.admission_budget(self)
+                self._pp_budget_stats["calls"] += 1
+                self._pp_budget_stats["seconds"] += time.monotonic() - started
+            else:
+                self._pp_budget_stats["skipped"] += 1
             packet.required, packet.waiting_tokens, packet.admission_budget = (
                 self._pp_required,
                 self._pp_waiting_tokens,
@@ -1240,6 +1257,7 @@ class SchedulerMultiplexPPMixin:
         data = dict(
             partition=self._pp_stream_idx,
             slice_choices=self._pp_slice_choices.copy(),
+            admission_budget_eval=self._pp_budget_stats.copy(),
             samples=[self._pp_models.decode.count, self._pp_models.prefill.count],
             mape=[self._pp_models.decode.mape, self._pp_models.prefill.mape],
             prefill_slice_mape=self._pp_models.prefill_slice.mape,

@@ -125,7 +125,9 @@ class TestProtocol(unittest.TestCase):
 
     def test_merge_releases_slot_even_before_send_polling(self):
         s = SchedulerMultiplexPPMixin()
-        s.server_args = SimpleNamespace(pdmux_pp_runnable_partition=False)
+        s.server_args = SimpleNamespace(
+            pdmux_pp_runnable_partition=False, pdmux_pp_cpu_merge_tokens=True
+        )
         s._pp_timing = SimpleNamespace(request_event=lambda *a, **kw: None)
         s.tp_size, s.tp_rank, s._pp_leader = 1, 0, False
         s.device, s.pp_rank = "cpu", 1
@@ -153,8 +155,14 @@ class TestProtocol(unittest.TestCase):
         s._pp_prefills = {7: work}
         s._pp_pending_merges, s.pp_size = [[], []], 2
         s.split_prefill_batch = batch
-        s.process_batch_result = lambda batch, result: None
+        processed = []
+        s.process_batch_result = lambda batch, result: processed.append(
+            result.next_token_ids
+        )
         s._pp_merge(dict(batch_id=7, target_mb=0, next_token_ids=[9], targets=[0]), 0)
+        self.assertEqual(processed[0].device.type, "cpu")
+        self.assertEqual(processed[0].tolist(), [9])
+        self.assertEqual(batch.output_ids.tolist(), [9])
         self.assertEqual(waits, [("decode", event), ("receive", event)])
         self.assertEqual(len(s._pp_receive_pool.free), 2)
         self.assertIsNone(work.recv_slot)
@@ -188,7 +196,9 @@ class TestProtocol(unittest.TestCase):
 
     def test_pending_nccl_host_launch_never_synchronizes(self):
         s = SchedulerMultiplexPPMixin()
-        s.server_args = SimpleNamespace(pdmux_pp_runnable_partition=False)
+        s.server_args = SimpleNamespace(
+            pdmux_pp_runnable_partition=False, pdmux_pp_cpu_merge_tokens=True
+        )
         s._pp_timing = SimpleNamespace(request_event=lambda *a, **kw: None)
         s.tp_size, s.tp_rank, s._pp_leader = 1, 0, False
         s._pp_timing = SimpleNamespace(
@@ -213,7 +223,9 @@ class TestProtocol(unittest.TestCase):
 
     def test_local_fifo_skips_sent_batches_but_keeps_their_kv_owner(self):
         s = SchedulerMultiplexPPMixin()
-        s.server_args = SimpleNamespace(pdmux_pp_runnable_partition=False)
+        s.server_args = SimpleNamespace(
+            pdmux_pp_runnable_partition=False, pdmux_pp_cpu_merge_tokens=True
+        )
         s._pp_timing = SimpleNamespace(request_event=lambda *a, **kw: None)
         s.tp_size, s.tp_rank, s._pp_leader = 1, 0, False
         first = PrefillWork(None, object(), "done")

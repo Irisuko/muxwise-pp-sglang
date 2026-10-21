@@ -376,3 +376,48 @@ def test_adaptive_inflight_never_expands_long_prompt_backlog_or_hard_limit():
             for tokens in (0, 8192, 1000000):
                 result = limit(pp, hard, 8192, tokens, 1)
                 assert 1 <= result <= hard
+
+
+def test_lazy_budget_refreshes_before_actual_admission_and_preserves_demand():
+    import time
+    from collections import deque
+    from types import SimpleNamespace as NS
+    from unittest.mock import Mock
+    from sglang.srt.multiplex.multiplexing_pp import (
+        SchedulerMultiplexPPMixin,
+        PPControl,
+    )
+
+    s = SchedulerMultiplexPPMixin()
+    s.server_args = NS(
+        pdmux_pp_lazy_admission_budget=True,
+        pdmux_pp_arrival_window=10.0,
+        pdmux_pp_slo_ttft=5.0,
+        pdmux_pp_slo_tpot=0.1,
+        pdmux_pp_fresh_eps=0.25,
+    )
+    s._pp_leader = True
+    s.waiting_queue = []
+    s._pp_arrivals = deque()
+    s._pp_prefills = {}
+    s._pp_max_prefills = 3
+    s._pp_admission_budget = 16384
+    s._pp_budget_stats = dict(calls=0, skipped=0, seconds=0.0)
+    s.mux_pp_policy = NS(admission_budget=Mock(return_value=8192))
+    packet = PPControl(1, 0)
+    s._pp_update_demand(packet)
+    s.mux_pp_policy.admission_budget.assert_not_called()
+    s.waiting_queue = [NS(_pp_arrival=time.monotonic() - 2, _pp_effective_tokens=100)]
+    s._pp_update_demand(packet)
+    assert (
+        packet.admission_budget == 8192
+        and packet.required > 0
+        and packet.waiting_tokens == 100
+    )
+    assert s.mux_pp_policy.admission_budget.call_count == 1
+    s._pp_prefills = {i: None for i in range(3)}
+    s._pp_update_demand(packet)
+    assert s.mux_pp_policy.admission_budget.call_count == 1 and packet.required > 0
+    s.server_args.pdmux_pp_lazy_admission_budget = False
+    s._pp_update_demand(packet)
+    assert s.mux_pp_policy.admission_budget.call_count == 2
