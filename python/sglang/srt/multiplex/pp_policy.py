@@ -91,6 +91,16 @@ def choose_partition(
     return max(candidates, key=lambda i: (sm_counts[i][1], -i))
 
 
+def local_prefill_runnable(works):
+    """The FIFO head owns local compute; remote/unmerged KV is not GPU work.
+
+    Receiving counts as imminent compute so the partition is ready on arrival.
+    Existing event/transfer fences still decide whether a switch is safe.
+    """
+    head = next((w for w in works if w.state != "done"), None)
+    return head is not None and head.state in ("compute", "receiving")
+
+
 def calibrated_decode_time(records, bs, mean_context):
     """Upper grid corner, never extrapolate from an unvisited SM partition.
 

@@ -125,6 +125,7 @@ class TestProtocol(unittest.TestCase):
 
     def test_merge_releases_slot_even_before_send_polling(self):
         s = SchedulerMultiplexPPMixin()
+        s.server_args = SimpleNamespace(pdmux_pp_runnable_partition=False)
         s._pp_timing = SimpleNamespace(request_event=lambda *a, **kw: None)
         s.tp_size, s.tp_rank, s._pp_leader = 1, 0, False
         s.device, s.pp_rank = "cpu", 1
@@ -187,6 +188,7 @@ class TestProtocol(unittest.TestCase):
 
     def test_pending_nccl_host_launch_never_synchronizes(self):
         s = SchedulerMultiplexPPMixin()
+        s.server_args = SimpleNamespace(pdmux_pp_runnable_partition=False)
         s._pp_timing = SimpleNamespace(request_event=lambda *a, **kw: None)
         s.tp_size, s.tp_rank, s._pp_leader = 1, 0, False
         s._pp_timing = SimpleNamespace(
@@ -211,6 +213,7 @@ class TestProtocol(unittest.TestCase):
 
     def test_local_fifo_skips_sent_batches_but_keeps_their_kv_owner(self):
         s = SchedulerMultiplexPPMixin()
+        s.server_args = SimpleNamespace(pdmux_pp_runnable_partition=False)
         s._pp_timing = SimpleNamespace(request_event=lambda *a, **kw: None)
         s.tp_size, s.tp_rank, s._pp_leader = 1, 0, False
         first = PrefillWork(None, object(), "done")

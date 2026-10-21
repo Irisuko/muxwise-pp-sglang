@@ -26,6 +26,7 @@ def _worker(rank, rendezvous):
     )
     groups = [dist.new_group(ranks) for ranks in ([0, 1], [2, 3])]
     s = SchedulerMultiplexPPMixin()
+    s.server_args = SimpleNamespace(pdmux_pp_runnable_partition=False)
     s.tp_size, s.tp_rank, s.pp_rank = 2, rank % 2, rank // 2
     s.tp_cpu_group = groups[s.pp_rank]
     s.tp_group = SimpleNamespace(ranks=[2 * s.pp_rank, 2 * s.pp_rank + 1])
@@ -125,6 +126,7 @@ def test_tp1_has_no_added_collectives(monkeypatch):
     monkeypatch.setattr(dist, "all_reduce", forbidden)
     monkeypatch.setattr(dist, "broadcast_object_list", forbidden)
     s = SchedulerMultiplexPPMixin()
+    s.server_args = SimpleNamespace(pdmux_pp_runnable_partition=False)
     s.tp_size = 1
     packet = PPControl(3, 1)
     assert s._pp_tp_broadcast(packet) is packet

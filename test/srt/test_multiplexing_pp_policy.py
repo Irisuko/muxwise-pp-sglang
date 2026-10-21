@@ -308,3 +308,19 @@ def test_latency_partition_preserves_decode_safety_and_unknown_rejection():
     assert choose_partition(sm, td, rates, 50, 2, 0.075, True) == 3
     td[3] = 0.04
     assert choose_partition(sm, td, rates, 50, 2, 0.075, True) == 3
+
+
+def test_runnable_prefill_respects_fifo_and_retained_remote_owners():
+    from types import SimpleNamespace
+    from sglang.srt.multiplex.pp_policy import local_prefill_runnable
+
+    def work(state):
+        return SimpleNamespace(state=state)
+
+    assert not local_prefill_runnable([])
+    assert not local_prefill_runnable([work("done"), work("waiting")])
+    assert not local_prefill_runnable([work("waiting"), work("receiving")])
+    assert not local_prefill_runnable([work("offering"), work("compute")])
+    assert not local_prefill_runnable([work("sending")])
+    assert local_prefill_runnable([work("done"), work("receiving")])
+    assert local_prefill_runnable([work("compute")])

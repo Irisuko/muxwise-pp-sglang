@@ -33,6 +33,7 @@ from sglang.srt.multiplex.pp_admission import AdmissionStats
 from sglang.srt.multiplex.pp_policy import (
     ALPMuxPPPolicy,
     balanced_assignment,
+    local_prefill_runnable,
     migration_rids,
     rebalance_pair,
     req_context,
@@ -557,7 +558,11 @@ class SchedulerMultiplexPPMixin:
                 self.pdmux_config,
                 len(self.stream_groups),
                 decode_bs,
-                any(w.state != "done" for w in self._pp_prefills.values()),
+                (
+                    local_prefill_runnable(self._pp_prefills.values())
+                    if self.server_args.pdmux_pp_runnable_partition
+                    else any(w.state != "done" for w in self._pp_prefills.values())
+                ),
             )
         idx = self._pp_tp_broadcast(idx)
         if idx == self._pp_stream_idx:
