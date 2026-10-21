@@ -40,6 +40,7 @@ from sglang.srt.multiplex.pp_policy import (
     rebalance_pair,
     req_context,
     required_throughput,
+    work_bounded_inflight_limit,
 )
 from sglang.srt.multiplex.pp_timing import LaneTimings
 
@@ -444,7 +445,7 @@ class SchedulerMultiplexPPMixin:
         self.tp_worker.model_runner.model.pdmux_pp_timing = self._pp_timing
         self._pp_clock_host = socket.gethostname()
         self._pp_upstream_decode = None
-        self._pp_slice_choices = [0, 0, 0]  # planned, shortened, layers saved
+        self._pp_slice_choices = [0, 0, 0]  # planned, shortened, sum(base_count-count)
         self._pp_required = 0.0
         self._pp_waiting_tokens = 0
         self._pp_admission_budget = self.max_prefill_tokens
@@ -621,9 +622,23 @@ class SchedulerMultiplexPPMixin:
         if not self.waiting_queue:
             stats.record("empty")
             return None
-        if len(self._pp_prefills) >= self._pp_max_prefills:
-            stats.record("inflight")
+        limit = self._pp_max_prefills
+        if self.server_args.pdmux_pp_adaptive_inflight:
+            head = self.waiting_queue[0]
+            limit = work_bounded_inflight_limit(
+                self.pp_size,
+                limit,
+                self._pp_admission_budget,
+                sum(w.batch.extend_num_tokens for w in self._pp_prefills.values()),
+                getattr(head, "_pp_effective_tokens", len(head.origin_input_ids)),
+            )
+        if len(self._pp_prefills) >= limit:
+            stats.record("inflight", limit=limit, hard_limit=self._pp_max_prefills)
             return None
+        extra_slot = (
+            self.server_args.pdmux_pp_adaptive_inflight
+            and len(self._pp_prefills) >= (3 * self.pp_size + 1) // 2
+        )
         budget = self._pp_admission_budget
         if budget <= 0:
             stats.record("budget", budget=budget)
@@ -679,6 +694,15 @@ class SchedulerMultiplexPPMixin:
                 + self.tree_cache.evictable_size()
             )
             reason = stats.capacity_reason(available, needed, reserve)
+            # Arrival-time prefix estimates may become stale after eviction.
+            # Recheck the real locked probe before using an extra pipeline slot.
+            if (
+                reason is None
+                and extra_slot
+                and not selected
+                and req.extend_input_len > budget
+            ):
+                reason = "inflight"
             if (
                 reason is None
                 and selected

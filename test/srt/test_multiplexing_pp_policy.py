@@ -185,6 +185,7 @@ class TestAdmission(unittest.TestCase):
         s = SchedulerMultiplexPPMixin()
         s.server_args = SimpleNamespace(
             pdmux_pp_reserve_decode=True,
+            pdmux_pp_adaptive_inflight=True,
             pdmux_pp_balance_merge=True,
             max_micro_batch_size=32,
         )
@@ -360,3 +361,18 @@ def test_upstream_forecast_rejects_stale_or_other_host_clocks():
     assert p.arrival_slice_layers(8, notice, 1.0, "other") == 8
     assert p.arrival_slice_layers(8, notice, 1.2, "node") == 8
     assert p.arrival_slice_layers(8, None, 1.0, "node") == 8
+
+
+def test_adaptive_inflight_never_expands_long_prompt_backlog_or_hard_limit():
+    from sglang.srt.multiplex.pp_policy import work_bounded_inflight_limit as limit
+
+    assert limit(2, 4, 8192, 3 * 8192, 8192) == 4
+    assert limit(2, 4, 8192, 3 * 8192 + 1, 8192) == 3
+    assert limit(2, 4, 8192, 0, 8193) == 3
+    assert limit(4, 8, 8192, 6 * 8192, 8192) == 8
+    assert limit(4, 8, 8192, 6 * 8192 + 1, 1) == 6
+    for pp in (2, 4):
+        for hard in (1, 2, 3, 4, 8):
+            for tokens in (0, 8192, 1000000):
+                result = limit(pp, hard, 8192, tokens, 1)
+                assert 1 <= result <= hard

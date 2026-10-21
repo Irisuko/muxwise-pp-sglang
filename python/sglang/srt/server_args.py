@@ -436,6 +436,7 @@ class ServerArgs:
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
     pdmux_prefill_mlp_chunk_tokens: int = 0
+    pdmux_pp_adaptive_inflight: bool = True
     pdmux_pp_decode_aware_slices: bool = True
     pdmux_pp_runnable_partition: bool = True
     pdmux_pp_latency_partition: bool = True
@@ -2639,6 +2640,12 @@ class ServerArgs:
             type=int,
             default=0,
             help="Token rows per Llama split-prefill MLP call (TP1, PP1 or PP>1); 0 disables chunking.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-adaptive-inflight",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.pdmux_pp_adaptive_inflight,
+            help="Allow extra prefill batches only for bounded small-batch work in flight.",
         )
         parser.add_argument(
             "--pdmux-pp-decode-aware-slices",

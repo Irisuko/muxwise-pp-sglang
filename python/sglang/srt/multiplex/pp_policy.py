@@ -91,6 +91,26 @@ def choose_partition(
     return max(candidates, key=lambda i: (sm_counts[i][1], -i))
 
 
+def work_bounded_inflight_limit(
+    pp_size, hard_limit, token_budget, inflight_tokens, head_tokens
+):
+    """Extend the pipeline for small FIFO batches, not for more long prompts.
+
+    The old 1.5*PP-depth operating point remains the soft limit. Extra slots
+    require both existing work and the next FCFS request to fit a bounded token
+    envelope. This is a scheduling gate only; allocator and future-output
+    reservation checks still run unchanged for every admitted request.
+    """
+    soft = min(hard_limit, (3 * pp_size + 1) // 2)
+    if (
+        token_budget > 0
+        and head_tokens <= token_budget
+        and inflight_tokens <= soft * token_budget
+    ):
+        return hard_limit
+    return soft
+
+
 def decode_gap_layers(base_count, layer_seconds, gap_seconds):
     """Only shorten a slice if at least one whole layer fits the forecast gap.
 
