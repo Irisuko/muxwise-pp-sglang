@@ -38,7 +38,7 @@ def test_infinite_demand_chooses_largest_safe_prefill_even_with_infinite_rate():
 
 def test_lane_wall_accounting_partitions_and_wait_phases():
     clock = [0.0]
-    s = SimpleNamespace(_pp_prefills={})
+    s = SimpleNamespace(_pp_prefills={}, server_args=SimpleNamespace())
     with patch(
         "sglang.srt.multiplex.pp_timing.time.monotonic", side_effect=lambda: clock[0]
     ):
@@ -120,7 +120,10 @@ def test_endpoint_transition_counts_gpu_time_without_poisoning_rls():
 
     models = Mock()
     scheduler = SimpleNamespace(
-        sm_counts=[(128, 0)], _pp_stream_idx=0, _pp_models=models
+        sm_counts=[(128, 0)],
+        _pp_stream_idx=0,
+        _pp_models=models,
+        server_args=SimpleNamespace(),
     )
     timer = LaneTimings(scheduler)
     with patch("sglang.srt.multiplex.pp_timing.torch.cuda.Event", Event):

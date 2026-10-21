@@ -292,3 +292,19 @@ class TestBatchSplit(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_latency_partition_preserves_decode_safety_and_unknown_rejection():
+    from sglang.srt.multiplex.pp_policy import choose_partition
+
+    sm = [(128, 0), (120, 8), (96, 32), (64, 64), (0, 128)]
+    td = [float("inf"), float("inf"), 0.02, 0.01, 0.005]
+    rates = [200, 180, 150, 100, 0]
+    # A light arrival rate previously chose the slowest prefill lane.
+    assert choose_partition(sm, td, rates, 50, 2, 0.075) == 3
+    assert choose_partition(sm, td, rates, 50, 2, 0.075, True) == 2
+    # No preference may turn an unknown/unsafe decode partition into a candidate.
+    td[2] = 0.04
+    assert choose_partition(sm, td, rates, 50, 2, 0.075, True) == 3
+    td[3] = 0.04
+    assert choose_partition(sm, td, rates, 50, 2, 0.075, True) == 3

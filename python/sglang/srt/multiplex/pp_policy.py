@@ -63,13 +63,26 @@ def sm_features(base, sm, total_sm):
     return [*base, *(v * scale for v in base[:-1])]
 
 
-def choose_partition(sm_counts, decode_times, prefill_rates, required, pp_size, tpot):
+def choose_partition(
+    sm_counts,
+    decode_times,
+    prefill_rates,
+    required,
+    pp_size,
+    tpot,
+    prefer_prefill=False,
+):
     candidates = [i for i, (p, d) in enumerate(sm_counts) if p > 0 and d > 0]
     safe = [
         i
         for i in candidates
         if np.isfinite(decode_times[i]) and pp_size * decode_times[i] <= tpot
     ]
+    # Meeting the arrival rate alone can leave requests spending seconds in a
+    # local prefill FIFO. Use spare decode SLO headroom to drain that FIFO; the
+    # exact same calibrated safety set still bounds the decode lane.
+    if prefer_prefill and safe:
+        return max(safe, key=lambda i: (sm_counts[i][0], -i))
     enough = [i for i in safe if np.isfinite(required) and prefill_rates[i] >= required]
     if enough:
         return min(enough, key=lambda i: (sm_counts[i][0], i))
@@ -303,6 +316,7 @@ class ALPMuxPPPolicy:
             s._pp_required if self.prefill.ready else float("inf"),
             s.pp_size,
             self.args.pdmux_pp_slo_tpot * self.args.pdmux_pp_tpot_coeff,
+            prefer_prefill=getattr(self.args, "pdmux_pp_latency_partition", False),
         )
         if chosen != self.candidate:
             self.candidate, self.candidate_count = chosen, 0
