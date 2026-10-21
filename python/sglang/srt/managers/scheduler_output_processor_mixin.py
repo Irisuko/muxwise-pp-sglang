@@ -703,6 +703,22 @@ class SchedulerOutputProcessorMixin:
             ):
                 req.log_time_stats()
 
+        # First-token diagnostic only; never changes request/cache lifecycle.
+        timer = getattr(self, "_pp_timing", None)
+        if timer is not None and self.pp_rank == 0:
+            first = [
+                r.rid
+                for r in reqs
+                if r.rid in rids
+                and r.output_ids
+                and not getattr(r, "_pp_traced_output", False)
+            ]
+            if first:
+                timer.request_event("emit", rids=first)
+                for r in reqs:
+                    if r.rid in first:
+                        r._pp_traced_output = True
+
         # Send to detokenizer
         if rids:
             if self.model_config.is_multimodal_gen:

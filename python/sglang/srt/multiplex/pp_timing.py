@@ -25,6 +25,12 @@ class LaneTimings:
             if rounds and scheduler.pp_rank == 0 and scheduler.tp_rank == 0
             else None
         )
+        request_trace = getattr(scheduler.server_args, "pdmux_pp_request_trace", None)
+        self.request_trace = (
+            open(f"{request_trace}.{scheduler.pp_rank}.jsonl", "w", buffering=1)
+            if request_trace and scheduler.tp_rank == 0
+            else None
+        )
         self.round_previous = {}
         self.started = time.monotonic()
         self.phase = {"prefill": "empty", "decode": "control"}
@@ -35,6 +41,31 @@ class LaneTimings:
         self.partitions = defaultdict(float)
         self.partition_since = self.started
         self.partition = 0
+
+    def request_event(self, event, work=None, rids=None, **fields):
+        if self.request_trace is None or (rids is not None and not rids):
+            return
+        if work is not None:
+            fields.update(
+                batch=work.plan.batch_id,
+                rids=work.plan.rids,
+                batch_key=id(work.batch),
+                state=work.state,
+            )
+        elif rids is not None:
+            fields["rids"] = rids
+        self.request_trace.write(
+            json.dumps(
+                dict(
+                    event=event,
+                    at=time.time(),
+                    mono=time.monotonic(),
+                    stage=self.s.pp_rank,
+                    **fields,
+                )
+            )
+            + "\n"
+        )
 
     def decode_launch(self, mb, batch):
         if self.round_trace is None:
@@ -144,6 +175,15 @@ class LaneTimings:
                             )
                         )
                         + "\n"
+                    )
+                if kind == "prefill":
+                    self.request_event(
+                        "cuda_slice",
+                        batch_key=batch_key,
+                        seconds=seconds,
+                        layers=layers,
+                        partition=idx,
+                        detail=detail,
                     )
                 self.cuda[kind] += seconds
                 key = f"{kind}_{detail}"

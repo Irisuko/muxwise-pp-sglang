@@ -125,6 +125,7 @@ class TestProtocol(unittest.TestCase):
 
     def test_merge_releases_slot_even_before_send_polling(self):
         s = SchedulerMultiplexPPMixin()
+        s._pp_timing = SimpleNamespace(request_event=lambda *a, **kw: None)
         s.tp_size, s.tp_rank, s._pp_leader = 1, 0, False
         s.device, s.pp_rank = "cpu", 1
         waits = []
@@ -186,8 +187,11 @@ class TestProtocol(unittest.TestCase):
 
     def test_pending_nccl_host_launch_never_synchronizes(self):
         s = SchedulerMultiplexPPMixin()
+        s._pp_timing = SimpleNamespace(request_event=lambda *a, **kw: None)
         s.tp_size, s.tp_rank, s._pp_leader = 1, 0, False
-        s._pp_timing = SimpleNamespace(prefill_state=lambda: None)
+        s._pp_timing = SimpleNamespace(
+            prefill_state=lambda: None, request_event=lambda *a, **kw: None
+        )
         s.prefill_mailbox = SimpleNamespace(poll=lambda: None)
         work = PrefillWork(None, None, "receiving", launched=threading.Event())
         s._pp_prefills = {0: work}
@@ -207,13 +211,16 @@ class TestProtocol(unittest.TestCase):
 
     def test_local_fifo_skips_sent_batches_but_keeps_their_kv_owner(self):
         s = SchedulerMultiplexPPMixin()
+        s._pp_timing = SimpleNamespace(request_event=lambda *a, **kw: None)
         s.tp_size, s.tp_rank, s._pp_leader = 1, 0, False
         first = PrefillWork(None, object(), "done")
         second = PrefillWork(SimpleNamespace(batch_id=2), object(), "waiting")
         third = PrefillWork(SimpleNamespace(batch_id=3), object(), "waiting")
         s._pp_prefills = {1: first, 2: second, 3: third}
         s._pp_envelopes = {}
-        s._pp_timing = SimpleNamespace(prefill_state=lambda: None)
+        s._pp_timing = SimpleNamespace(
+            prefill_state=lambda: None, request_event=lambda *a, **kw: None
+        )
         s.prefill_mailbox = SimpleNamespace(poll=lambda: None)
         s._pp_progress_prefill()
         self.assertIs(s.split_prefill_batch, second.batch)

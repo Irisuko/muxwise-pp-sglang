@@ -436,6 +436,7 @@ class ServerArgs:
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
     pdmux_prefill_mlp_chunk_tokens: int = 0
+    pdmux_pp_request_trace: Optional[str] = None
     pdmux_pp_policy: str = "alp"
     pdmux_pp_slo_ttft: float = 5.0
     pdmux_pp_slo_tpot: float = 0.1
@@ -2635,6 +2636,12 @@ class ServerArgs:
             type=int,
             default=0,
             help="Token rows per Llama split-prefill MLP call (TP1, PP1 or PP>1); 0 disables chunking.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-request-trace",
+            type=str,
+            default=None,
+            help="Optional per-stage request timeline JSONL path prefix (TP0 only).",
         )
         parser.add_argument(
             "--pdmux-pp-policy",

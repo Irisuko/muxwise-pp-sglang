@@ -146,6 +146,8 @@ class PrefillWork:
     proxy: object = None
     tokens: object = None
     recv_slot: Optional[int] = None
+    trace_started: bool = False
+    trace_slice: bool = False
 
 
 class PrefillReceivePool:
@@ -714,6 +716,12 @@ class SchedulerMultiplexPPMixin:
         self._pp_prefills[plan.batch_id] = PrefillWork(
             plan, batch, "compute" if self.pp_rank == 0 else "waiting", event
         )
+        self._pp_timing.request_event(
+            "admit",
+            self._pp_prefills[plan.batch_id],
+            tokens=batch.extend_num_tokens,
+            cached=sum(len(r.prefix_indices) for r in reqs),
+        )
         self._pp_cached_tokens += sum(len(r.prefix_indices) for r in reqs)
         logger.debug(
             "MuxWise-PP admit batch=%s requests=%s tokens=%s cached=%s inflight=%s",
@@ -742,6 +750,9 @@ class SchedulerMultiplexPPMixin:
         else:
             acquired = pool.acquire(envelope["tensors"])
             if acquired is None:
+                if not getattr(work, "trace_slot_wait", False):
+                    self._pp_timing.request_event("receive_slot_wait", work)
+                    work.trace_slot_wait = True
                 return False
             work.recv_slot, tensors = acquired
             stream = self._pp_receive_stream
@@ -750,6 +761,7 @@ class SchedulerMultiplexPPMixin:
             False, tensors, stream
         )
         work.state = "receiving"
+        self._pp_timing.request_event("receive_posted", work)
         self.prefill_mailbox.outbox.put(dict(kind="ready", batch_id=work.plan.batch_id))
         return True
 
@@ -783,6 +795,7 @@ class SchedulerMultiplexPPMixin:
                 continue
             if self.pp_rank == 0:
                 assert envelope["kind"] == "result" and bid in self._pp_prefills
+                self._pp_timing.request_event("result_received", self._pp_prefills[bid])
                 self._pp_merge_ready.append(
                     dict(
                         batch_id=bid,
@@ -792,6 +805,9 @@ class SchedulerMultiplexPPMixin:
                 )
             else:
                 assert bid not in self._pp_envelopes
+                self._pp_timing.request_event(
+                    "hidden_metadata", rids=envelope["plan"].rids, batch=bid
+                )
                 self._pp_envelopes[bid] = envelope
         # Keep compute FIFO while allowing at most one additional input to arrive.
         # A sent batch retains its KV ownership until the ordered MERGE.
@@ -801,6 +817,9 @@ class SchedulerMultiplexPPMixin:
         self.split_prefill_batch = work.batch if work else None
         if work is None:
             return
+        if not getattr(work, "trace_head", False):
+            self._pp_timing.request_event("fifo_head", work)
+            work.trace_head = True
         if work.state == "waiting":
             envelope = self._pp_envelopes.get(work.plan.batch_id)
             if not self._pp_tp_all(envelope is not None):
@@ -821,16 +840,26 @@ class SchedulerMultiplexPPMixin:
                 return
             work.launched = None
             if work.state == "offering":
+                self._pp_timing.request_event("send_launched", work)
                 work.state = "sending"
         if not self._pp_tp_all(work.event is None or work.event.query()):
             return
+        if work.trace_slice:
+            self._pp_timing.request_event(
+                "slice_observed_done", work, layer=work.batch.split_index
+            )
+            work.trace_slice = False
+            if work.batch.split_index == self.tp_worker.model_runner.model.end_layer:
+                self._pp_timing.request_event("prefill_done", work)
         if work.state == "sending":
+            self._pp_timing.request_event("send_done", work)
             work.state, work.proxy = "done", None
             work.batch.split_forward_batch = None
             self._pp_release_receive(work)
             self.split_prefill_batch = None
             return
         if work.state == "receiving":
+            self._pp_timing.request_event("hidden_received", work)
             self._pp_prefill_stream.wait_event(work.event)
             work.state = "compute"
         batch = work.batch
@@ -843,6 +872,17 @@ class SchedulerMultiplexPPMixin:
             count = self.mux_pp_policy.slice_layers(
                 self.pdmux_config, batch.extend_num_tokens, end - batch.split_index
             )
+            if not work.trace_started:
+                self._pp_timing.request_event("prefill_start", work)
+                work.trace_started = True
+            self._pp_timing.request_event(
+                "slice_launch",
+                work,
+                layer=batch.split_index,
+                layers=count,
+                partition=self._pp_stream_idx,
+            )
+            work.trace_slice = True
             batch.split_forward_count = count
             self._pp_timing.mark("prefill", "compute_slot")
             result = self.run_batch(batch, pp_proxy_tensors=work.proxy)
@@ -860,6 +900,7 @@ class SchedulerMultiplexPPMixin:
             return
         if self.pp_group.is_last_rank:
             if self.tp_rank == 0:
+                self._pp_timing.request_event("result_send", work)
                 self.prefill_mailbox.outbox.put(
                     dict(
                         kind="result",
@@ -873,6 +914,7 @@ class SchedulerMultiplexPPMixin:
             self.split_prefill_batch = None
         else:
             tensors = work.proxy.tensors
+            self._pp_timing.request_event("hidden_offer", work)
             if self.pdmux_config.pp_prefetch:
                 work.launched, work.event = self.prefill_mailbox.send_when_ready(
                     work.plan.batch_id, tensors, self._pp_prefill_stream
@@ -892,6 +934,7 @@ class SchedulerMultiplexPPMixin:
 
     def _pp_merge(self, merge, mb_id):
         work = self._pp_prefills[merge["batch_id"]]
+        self._pp_timing.request_event("merge", work, mb=mb_id)
         assert merge["target_mb"] == mb_id
         batch = work.batch
         assert batch.split_prefill_finished
@@ -1252,6 +1295,10 @@ class SchedulerMultiplexPPMixin:
                         set_pdmux_status(False)
                         if self.pp_rank == 0:
                             requests = self.recv_requests()
+                            self._pp_timing.request_event(
+                                "arrival",
+                                rids=[r.rid for r in requests if hasattr(r, "rid")],
+                            )
                             packet = PPControl(step, mb_id, requests=requests)
                             if (
                                 transport
