@@ -91,6 +91,24 @@ def choose_partition(
     return max(candidates, key=lambda i: (sm_counts[i][1], -i))
 
 
+def decode_gap_layers(base_count, layer_seconds, gap_seconds):
+    """Only shorten a slice if at least one whole layer fits the forecast gap.
+
+    A layer is not preemptible. Fragmenting an already overlapping mixed-lane
+    workload when even one layer cannot fit just adds scheduler/TP overhead.
+    Keep 20% prediction margin and never exceed the original token-layer cap.
+    """
+    if (
+        not np.isfinite(layer_seconds)
+        or layer_seconds <= 0
+        or not np.isfinite(gap_seconds)
+        or gap_seconds <= 0
+    ):
+        return base_count
+    fit = int(gap_seconds / (1.2 * layer_seconds))
+    return min(base_count, fit) if fit >= 1 else base_count
+
+
 def local_prefill_runnable(works):
     """The FIFO head owns local compute; remote/unmerged KV is not GPU work.
 
@@ -380,6 +398,30 @@ class ALPMuxPPPolicy:
             ):
                 best = budget
         return best
+
+    def decode_seconds(self, bs, ctx, idx):
+        if self.decode_calibration:
+            estimate = calibrated_decode_time(
+                self.decode_calibration.get(idx, []), bs, ctx / max(bs, 1)
+            )
+            return estimate * self.decode_scale[idx] + 0.001
+        if self.decode.ready:
+            return self.decode.predict(self.features("decode", [bs, ctx / 1e4, 1], idx))
+        return float("inf")
+
+    def arrival_slice_layers(self, base_count, notice, now, host):
+        if (
+            not notice
+            or notice["host"] != host
+            or not notice["bs"]
+            or now - notice["issued_at"] > self.args.pdmux_pp_slo_tpot
+            or not self.prefill.ready
+        ):
+            return base_count
+        layer = self.prefill.predict(
+            self.features("prefill", self._prefill_base(), self.s._pp_stream_idx)
+        )
+        return decode_gap_layers(base_count, layer, notice["eta"] - now - 0.001)
 
     def merge_target(self, running_mbs):
         return self.fallback.merge_target(running_mbs)

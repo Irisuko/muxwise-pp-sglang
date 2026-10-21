@@ -324,3 +324,39 @@ def test_runnable_prefill_respects_fifo_and_retained_remote_owners():
     assert not local_prefill_runnable([work("sending")])
     assert local_prefill_runnable([work("done"), work("receiving")])
     assert local_prefill_runnable([work("compute")])
+
+
+def test_decode_gap_slices_are_bounded_and_do_not_fragment_impossible_gaps():
+    from sglang.srt.multiplex.pp_policy import decode_gap_layers
+
+    assert decode_gap_layers(8, 0.002, 0.010) == 4
+    assert decode_gap_layers(8, 0.002, 0.003) == 1
+    assert decode_gap_layers(8, 0.002, 0.001) == 8
+    assert decode_gap_layers(8, 0.002, 0.1) == 8
+    for layer, gap in [
+        (0, 0.01),
+        (float("inf"), 0.01),
+        (0.002, -1),
+        (0.002, float("nan")),
+    ]:
+        assert decode_gap_layers(8, layer, gap) == 8
+
+
+def test_upstream_forecast_rejects_stale_or_other_host_clocks():
+    from types import SimpleNamespace
+    from sglang.srt.multiplex.pp_policy import ALPMuxPPPolicy
+
+    s = SimpleNamespace(
+        server_args=SimpleNamespace(pdmux_pp_slo_tpot=0.1),
+        sm_counts=[(96, 32)],
+        _pp_stream_idx=0,
+    )
+    p = ALPMuxPPPolicy(s, None)
+    p.prefill.count = 16
+    p.prefill.theta[4] = 0.002
+    p._prefill_base = lambda: [1, 1, 0, 1, 1]
+    notice = dict(host="node", bs=4, issued_at=1.0, eta=1.011)
+    assert p.arrival_slice_layers(8, notice, 1.0, "node") == 4
+    assert p.arrival_slice_layers(8, notice, 1.0, "other") == 8
+    assert p.arrival_slice_layers(8, notice, 1.2, "node") == 8
+    assert p.arrival_slice_layers(8, None, 1.0, "node") == 8

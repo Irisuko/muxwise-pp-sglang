@@ -42,6 +42,16 @@ def _worker(rank, rendezvous):
         admission_budget=4096,
         merge={"batch_id": 7, "next_token_ids": [42]},
         retired={"step": 15, "mb_id": 1, "tokens": [6]},
+        decode_notice={
+            "step": 17,
+            "mb": 1,
+            "bs": 4,
+            "ctx": 8192,
+            "issued_at": 1.0,
+            "eta": 1.01,
+            "seconds": 0.01,
+            "host": "node",
+        },
     )
     packet = (
         s._pp_tp_broadcast(expected if rank == 0 else None) if s.pp_rank == 0 else None

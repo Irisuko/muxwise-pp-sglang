@@ -7,7 +7,9 @@ unmatched receive is never followed by a stream synchronize/partition change.
 """
 
 import logging
+import math
 import queue
+import socket
 import threading
 import time
 from collections import deque
@@ -86,6 +88,8 @@ class PPControl:
     admission_budget: int = 0
     decode_bs: int = 0
     retired: Optional[dict] = None
+    # Telemetry only: each upstream stage stamps its own forecast before relay.
+    decode_notice: Optional[dict] = None
 
 
 class StaticMuxPPPolicy:
@@ -438,6 +442,9 @@ class SchedulerMultiplexPPMixin:
         self._pp_timing = LaneTimings(self)
         self.tp_worker.pdmux_pp_timing = self._pp_timing
         self.tp_worker.model_runner.model.pdmux_pp_timing = self._pp_timing
+        self._pp_clock_host = socket.gethostname()
+        self._pp_upstream_decode = None
+        self._pp_slice_choices = [0, 0, 0]  # planned, shortened, layers saved
         self._pp_required = 0.0
         self._pp_waiting_tokens = 0
         self._pp_admission_budget = self.max_prefill_tokens
@@ -588,6 +595,25 @@ class SchedulerMultiplexPPMixin:
             idx,
             decode_bs,
             self.sm_counts[idx],
+        )
+
+    def _pp_decode_notice(self, packet):
+        if not self.server_args.pdmux_pp_decode_aware_slices or not self.cur_batch:
+            return None
+        bs, ctx = self.cur_batch.batch_size(), self.cur_batch.seq_lens_sum
+        seconds = self._pp_models.decode_seconds(bs, ctx, self._pp_stream_idx)
+        if not math.isfinite(seconds):
+            return None
+        now = time.monotonic()
+        return dict(
+            step=packet.step,
+            mb=packet.mb_id,
+            bs=bs,
+            ctx=ctx,
+            issued_at=now,
+            seconds=seconds,
+            eta=now + seconds,
+            host=self._pp_clock_host,
         )
 
     def _pp_make_plan(self):
@@ -877,6 +903,22 @@ class SchedulerMultiplexPPMixin:
             count = self.mux_pp_policy.slice_layers(
                 self.pdmux_config, batch.extend_num_tokens, end - batch.split_index
             )
+            base_count = count
+            if self.server_args.pdmux_pp_decode_aware_slices and self.pp_rank:
+                count = self._pp_tp_broadcast(
+                    self._pp_models.arrival_slice_layers(
+                        count,
+                        self._pp_upstream_decode,
+                        time.monotonic(),
+                        self._pp_clock_host,
+                    )
+                    if self.tp_rank == 0
+                    else None
+                )
+                assert 1 <= count <= base_count
+                self._pp_slice_choices[0] += 1
+                self._pp_slice_choices[1] += count < base_count
+                self._pp_slice_choices[2] += base_count - count
             if not work.trace_started:
                 self._pp_timing.request_event("prefill_start", work)
                 work.trace_started = True
@@ -884,6 +926,8 @@ class SchedulerMultiplexPPMixin:
                 "slice_launch",
                 work,
                 layer=batch.split_index,
+                base_layers=base_count,
+                upstream_decode=self._pp_upstream_decode,
                 layers=count,
                 partition=self._pp_stream_idx,
             )
@@ -1171,6 +1215,7 @@ class SchedulerMultiplexPPMixin:
             return
         data = dict(
             partition=self._pp_stream_idx,
+            slice_choices=self._pp_slice_choices.copy(),
             samples=[self._pp_models.decode.count, self._pp_models.prefill.count],
             mape=[self._pp_models.decode.mape, self._pp_models.prefill.mape],
             prefill_slice_mape=self._pp_models.prefill_slice.mape,
@@ -1334,6 +1379,9 @@ class SchedulerMultiplexPPMixin:
                             packet = obj[0]
                             assert (packet.step, packet.mb_id) == (step, mb_id)
                         assert (packet.step, packet.mb_id) == (step, mb_id)
+                        self._pp_upstream_decode = (
+                            packet.decode_notice if self.pp_rank else None
+                        )
                         if transport:
                             transport.check()
                             if packet.retired is not None:
@@ -1418,6 +1466,8 @@ class SchedulerMultiplexPPMixin:
                             packet.decode_bs = (
                                 self.cur_batch.batch_size() if self.cur_batch else 0
                             )
+                        if self._pp_leader:
+                            packet.decode_notice = self._pp_decode_notice(packet)
                         if self._pp_leader and self.tp_size > 1:
                             self._pp_tp_broadcast(packet)
                         if transport:
@@ -1432,6 +1482,15 @@ class SchedulerMultiplexPPMixin:
                             if not self.pp_group.is_last_rank:
                                 # Includes proxy shape and retired tokens; prefetch on
                                 # the next stage while this stage computes.
+                                if (
+                                    self.pp_rank
+                                    and self.server_args.pdmux_pp_decode_aware_slices
+                                ):
+                                    packet.decode_notice = self._pp_tp_broadcast(
+                                        self._pp_decode_notice(packet)
+                                        if self.tp_rank == 0
+                                        else None
+                                    )
                                 transport.send_control(packet)
                     with torch.cuda.stream(self._pp_prefill_stream):
                         set_pdmux_status(True)

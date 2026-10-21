@@ -436,6 +436,7 @@ class ServerArgs:
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
     pdmux_prefill_mlp_chunk_tokens: int = 0
+    pdmux_pp_decode_aware_slices: bool = True
     pdmux_pp_runnable_partition: bool = True
     pdmux_pp_latency_partition: bool = True
     pdmux_pp_request_trace: Optional[str] = None
@@ -2638,6 +2639,12 @@ class ServerArgs:
             type=int,
             default=0,
             help="Token rows per Llama split-prefill MLP call (TP1, PP1 or PP>1); 0 disables chunking.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-decode-aware-slices",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.pdmux_pp_decode_aware_slices,
+            help="Fit prefill slices into a same-host upstream decode arrival forecast when a layer fits.",
         )
         parser.add_argument(
             "--pdmux-pp-runnable-partition",
