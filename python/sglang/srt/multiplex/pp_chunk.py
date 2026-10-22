@@ -56,7 +56,7 @@ def chunk_batch(parent, chunk):
     batch.extend_lens = [n for _, _, n in chunk.spans]
     lengths = [p + n for p, n in zip(batch.prefix_lens, batch.extend_lens)]
     batch.seq_lens = torch.tensor(lengths, dtype=torch.int64, device=parent.device)
-    batch.seq_lens_cpu_cache = torch.tensor(lengths, dtype=torch.int64)
+    batch.pdmux_pp_seq_lens_cpu = torch.tensor(lengths, dtype=torch.int64)
     batch.seq_lens_sum = sum(lengths)
     batch.extend_num_tokens = chunk.tokens
     batch.pdmux_pp_full_prefill_tokens = parent.extend_num_tokens

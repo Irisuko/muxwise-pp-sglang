@@ -470,6 +470,7 @@ class ServerArgs:
     pdmux_pp_max_inflight_tokens: int = 0
     pdmux_pp_token_refill_size: int = 0
     pdmux_pp_prefill_projection_pad_to: int = 0
+    pdmux_pp_cpu_prefill_metadata: bool = False
     pdmux_pp_radix_eviction: str = "lru"
     sm_group_num: int = 8
 
@@ -2853,6 +2854,11 @@ class ServerArgs:
             help="Wait for this many token credits before admitting another batch, bounded by the current admission budget (0 disables).",
         )
         parser.add_argument(
+            "--pdmux-pp-cpu-prefill-metadata",
+            action="store_true",
+            help="Use CPU sequence and prefix lengths for PP prefill metadata, avoiding CUDA readback.",
+        )
+        parser.add_argument(
             "--pdmux-pp-radix-eviction",
             choices=["lru", "fifo"],
             default="lru",
@@ -3032,7 +3038,11 @@ class ServerArgs:
         assert self.pdmux_pp_prefill_projection_pad_to >= 0
         if self.pdmux_pp_prefill_projection_pad_to:
             assert self.pdmux_pp_prefill_chunk_size > 0
-        if self.pdmux_pp_prefill_chunk_size or self.pdmux_pp_max_inflight_tokens:
+        if (
+            self.pdmux_pp_prefill_chunk_size
+            or self.pdmux_pp_max_inflight_tokens
+            or self.pdmux_pp_cpu_prefill_metadata
+        ):
             assert self.enable_pdmux and self.pp_size > 1
         if self.enable_pdmux:
             if self.pp_size > 1:

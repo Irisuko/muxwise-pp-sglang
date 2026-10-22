@@ -834,6 +834,15 @@ class SchedulerMultiplexPPMixin:
             self.spec_algorithm,
         )
         batch.prepare_for_extend()
+        # The CPU already knows these lengths. Re-reading seq_lens from CUDA
+        # on the first split would synchronize prefill with the decode lane,
+        # including small whole batches that do not need CPP children.
+        if self.server_args.pdmux_pp_cpu_prefill_metadata:
+            batch.pdmux_pp_cpu_metadata = True
+            batch.pdmux_pp_seq_lens_cpu = torch.tensor(
+                [p + n for p, n in zip(batch.prefix_lens, batch.extend_lens)],
+                dtype=torch.int64,
+            )
         batch.forward_mode = ForwardMode.SPLIT_PREFILL
         batch.split_index = self.tp_worker.model_runner.model.start_layer
         self.waiting_queue = [

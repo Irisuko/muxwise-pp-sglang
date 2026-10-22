@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -321,6 +321,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 # A short query tail otherwise changes the automatic KV split
                 # and softmax reduction order relative to the full prefill.
                 disable_split_kv=append_chunk,
+                prefix_lens_sum=(
+                    sum(forward_batch.extend_prefix_lens_cpu)
+                    if getattr(forward_batch, "pdmux_pp_cpu_metadata", False)
+                    else None
+                ),
+                prefix_lens_cpu=(
+                    forward_batch.extend_prefix_lens_cpu
+                    if getattr(forward_batch, "pdmux_pp_cpu_metadata", False)
+                    else None
+                ),
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged, use_ragged, extend_no_prefix
@@ -948,6 +958,8 @@ class FlashInferIndicesUpdaterPrefill:
         ],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        prefix_lens_sum: Optional[int] = None,
+        prefix_lens_cpu: Optional[List[int]] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -967,12 +979,18 @@ class FlashInferIndicesUpdaterPrefill:
         ],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        prefix_lens_sum: Optional[int] = None,
+        prefix_lens_cpu: Optional[List[int]] = None,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
             # and forward_batch.extend_seq_lens_cpu
             paged_kernel_lens = prefix_lens
-            paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+            paged_kernel_lens_sum = (
+                prefix_lens_sum
+                if prefix_lens_sum is not None
+                else paged_kernel_lens.sum().item()
+            )
         else:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
@@ -992,6 +1010,9 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            cpu_lengths=(
+                (seq_lens_cpu, prefix_lens_cpu) if prefix_lens_cpu is not None else None
+            ),
         )
 
     def update_sliding_window(
@@ -1009,6 +1030,8 @@ class FlashInferIndicesUpdaterPrefill:
         ],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        prefix_lens_sum: Optional[int] = None,
+        prefix_lens_cpu: Optional[List[int]] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1060,6 +1083,8 @@ class FlashInferIndicesUpdaterPrefill:
         ],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        prefix_lens_sum: Optional[int] = None,
+        prefix_lens_cpu: Optional[List[int]] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1108,6 +1133,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        cpu_lengths: Optional[Tuple[torch.Tensor, List[int]]] = None,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1145,11 +1171,34 @@ class FlashInferIndicesUpdaterPrefill:
                 )
             )
 
+        plan_qo_indptr, plan_kv_indptr = qo_indptr, kv_indptr
+        plan_last_page_len = self.kv_last_page_len[:bs]
+        if cpu_lengths is not None:
+            # FlashInfer's planner reads device indptrs back to the CPU even
+            # when copy_ is nonblocking. PP already has equivalent CPU lengths;
+            # keep KV-index construction on CUDA and plan with host indptrs.
+            assert spec_info is None and not use_sliding_window_kv_pool
+            seq_cpu, prefix_cpu = cpu_lengths
+            assert seq_cpu.device.type == "cpu"
+            seq_cpu = seq_cpu.to(dtype=kv_indptr.dtype)
+            prefix_cpu = torch.tensor(prefix_cpu, dtype=kv_indptr.dtype)
+
+            def indptr(lengths, dtype):
+                return torch.cat(
+                    (torch.zeros(1, dtype=dtype), torch.cumsum(lengths, 0, dtype=dtype))
+                )
+
+            plan_qo_indptr = indptr(seq_cpu - prefix_cpu, qo_indptr.dtype)
+            plan_kv_indptr = indptr(
+                prefix_cpu if use_ragged else seq_cpu, kv_indptr.dtype
+            )
+            plan_last_page_len = torch.ones(bs, dtype=self.kv_last_page_len.dtype)
+
         # extend part
         if use_ragged:
             wrapper_ragged.begin_forward(
-                qo_indptr,
-                qo_indptr,
+                plan_qo_indptr,
+                plan_qo_indptr,
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
@@ -1166,10 +1215,10 @@ class FlashInferIndicesUpdaterPrefill:
 
         # cached part
         wrapper_paged.begin_forward(
-            qo_indptr,
-            kv_indptr,
+            plan_qo_indptr,
+            plan_kv_indptr,
             kv_indices,
-            self.kv_last_page_len[:bs],
+            plan_last_page_len,
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,

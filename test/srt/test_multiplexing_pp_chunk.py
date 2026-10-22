@@ -68,6 +68,7 @@ def test_views_preserve_full_allocation_and_request_state():
         children = [chunk_batch(parent, c) for c in plan_chunks(parent.extend_lens, 4)]
     assert [b.prefix_lens for b in children] == [[2, 7], [8], [12], [0]]
     assert [b.seq_lens.tolist() for b in children] == [[5, 8], [12], [16], [2]]
+    assert all(torch.equal(b.pdmux_pp_seq_lens_cpu, b.seq_lens) for b in children)
     assert [b.sampling_info for b in children] == [["0"], None, ["1"], ["2"]]
     assert [b.pdmux_pp_append_chunk for b in children] == [False, True, True, False]
     assert all(owner() is not None for owner in owners)
@@ -145,7 +146,7 @@ def test_sampling_uses_only_terminal_rows_and_absolute_positions():
         split_forward_count=4,
         pdmux_pp_final_indices=[0],
         pdmux_pp_full_prefill_tokens=32,
-        seq_lens_cpu_cache=torch.tensor([13, 31]),
+        pdmux_pp_seq_lens_cpu=torch.tensor([13, 31]),
         get_model_worker_batch=lambda *_: metadata,
     )
     logits = NS(next_token_logits=torch.arange(8).view(2, 4))
@@ -167,7 +168,8 @@ def test_sampling_uses_only_terminal_rows_and_absolute_positions():
     assert ids.tolist() == [7]
 
 
-def test_admission_fence_covers_child_gpu_metadata():
+@pytest.mark.parametrize("cpu_metadata", [False, True])
+def test_admission_fence_covers_child_gpu_metadata(cpu_metadata):
     order = []
 
     def record():
@@ -176,8 +178,15 @@ def test_admission_fence_covers_child_gpu_metadata():
         return event
 
     req = NS(rid="r", prefix_indices=[])
-    parent_batch = NS(reqs=[req], extend_num_tokens=8, prepare_for_extend=lambda: None)
+    parent_batch = NS(
+        reqs=[req],
+        extend_num_tokens=8,
+        prefix_lens=[3],
+        extend_lens=[8],
+        prepare_for_extend=lambda: None,
+    )
     s = SchedulerMultiplexPPMixin()
+    s.server_args = NS(pdmux_pp_cpu_prefill_metadata=cpu_metadata)
     s.pp_rank = 0
     s._pp_prefills = {}
     s._pp_cached_tokens = 0
@@ -200,9 +209,49 @@ def test_admission_fence_covers_child_gpu_metadata():
     ), patch("sglang.srt.multiplex.multiplexing_pp.chunk_batch", side_effect=child):
         s._pp_build_prefill(plan, [req])
     owner = s._pp_prefills[7]
+    if cpu_metadata:
+        assert owner.batch.pdmux_pp_cpu_metadata
+        assert owner.batch.pdmux_pp_seq_lens_cpu.tolist() == [11]
+    else:
+        assert not hasattr(owner.batch, "pdmux_pp_seq_lens_cpu")
     assert all(c.event == owner.event for c in owner.chunks)
     assert owner.event > max(i for i, v in enumerate(order) if v[0] == "child_metadata")
     assert order[-1] == ("wait", owner.event)
+
+
+@pytest.mark.parametrize("pp", [False, True])
+def test_first_split_cpu_lengths_without_cuda_readback(pp):
+    from sglang.srt.managers.tp_worker import TpModelWorker
+
+    worker = TpModelWorker.__new__(TpModelWorker)
+    worker.pp_group = NS(is_last_rank=False)
+    lengths = torch.tensor([13, 31])
+    seen = []
+
+    def model_batch(cache):
+        seen.append(cache)
+        if pp:
+            assert cache is lengths, "PP must not fall back to seq_lens.cpu()"
+        return NS(seq_lens_cpu=cache if cache is not None else lengths)
+
+    batch = NS(
+        split_forward_batch=None,
+        split_index=0,
+        split_forward_count=4,
+        get_model_worker_batch=model_batch,
+    )
+    if pp:
+        batch.pdmux_pp_cpu_metadata = True
+        batch.pdmux_pp_seq_lens_cpu = lengths
+    worker.model_runner = NS(forward=lambda *a, **kw: (None, False))
+    with patch(
+        "sglang.srt.managers.tp_worker.ForwardBatch.init_new", return_value=NS()
+    ):
+        worker.forward_batch_split_prefill(batch)
+        worker.forward_batch_split_prefill(batch)
+    assert batch.split_forward_batch.pdmux_pp_cpu_metadata == pp
+    assert seen[0] is (lengths if pp else None)
+    assert seen[1] is lengths
 
 
 @pytest.mark.parametrize("adaptive", [False, True])
@@ -295,7 +344,10 @@ def test_token_admission_cap_and_oversized_fcfs_head(
 
 
 @pytest.mark.parametrize("append,prefix", [(None, 0), (None, 5), (False, 5), (True, 5)])
-def test_append_chunk_plans_one_full_context_attention(append, prefix, monkeypatch):
+@pytest.mark.parametrize("cpu_metadata", [False, True])
+def test_append_chunk_plans_one_full_context_attention(
+    append, prefix, cpu_metadata, monkeypatch
+):
     monkeypatch.setenv("SGLANG_ENABLE_TORCH_COMPILE", "0")
     from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -315,10 +367,102 @@ def test_append_chunk_plans_one_full_context_attention(append, prefix, monkeypat
         extend_prefix_lens=torch.tensor([prefix]),
         extend_prefix_lens_cpu=[prefix],
         encoder_lens=None,
+        pdmux_pp_cpu_metadata=cpu_metadata,
     )
     if append is not None:
         batch.pdmux_pp_append_chunk = append
     backend.init_forward_metadata(batch)
     assert plans[0]["use_ragged"] == (append is not True)
     assert plans[0]["disable_split_kv"] == (append is True)
+    assert plans[0]["prefix_lens_sum"] == (prefix if cpu_metadata else None)
+    assert plans[0]["prefix_lens_cpu"] == ([prefix] if cpu_metadata else None)
     assert backend.forward_metadata.use_ragged == (append is not True)
+
+
+@pytest.mark.parametrize("prefix_sum", [None, 0, 7])
+def test_cpu_prefix_sum_avoids_device_synchronization(prefix_sum, monkeypatch):
+    monkeypatch.setenv("SGLANG_ENABLE_TORCH_COMPILE", "0")
+    from sglang.srt.layers.attention.flashinfer_backend import (
+        FlashInferIndicesUpdaterPrefill,
+    )
+
+    class NoReadback:
+        def sum(self):
+            raise AssertionError("PP metadata must not synchronize a GPU prefix sum")
+
+    plans = []
+    updater = FlashInferIndicesUpdaterPrefill.__new__(FlashInferIndicesUpdaterPrefill)
+    updater.prefill_wrapper_ragged = object()
+    updater.kv_indptr = updater.qo_indptr = [object()]
+    updater.call_begin_forward = lambda *args, **kw: plans.append(args)
+    prefixes = torch.tensor([2, 5]) if prefix_sum is None else NoReadback()
+    updater.update_single_wrapper(
+        torch.tensor([0, 1]),
+        torch.tensor([6, 9]),
+        torch.tensor([6, 9]),
+        15,
+        prefixes,
+        [object()],
+        True,
+        None,
+        None,
+        prefix_lens_sum=prefix_sum,
+    )
+    assert plans[0][3] is prefixes
+    assert plans[0][4] == (7 if prefix_sum is None else prefix_sum)
+
+
+@pytest.mark.parametrize("cpu_metadata", [False, True])
+@pytest.mark.parametrize("ragged", [False, True])
+def test_cpu_attention_plan_preserves_query_and_kv_offsets(
+    cpu_metadata, ragged, monkeypatch
+):
+    monkeypatch.setenv("SGLANG_ENABLE_TORCH_COMPILE", "0")
+    import sglang.srt.layers.attention.flashinfer_backend as module
+
+    class FakeIndicesKernel:
+        def __getitem__(self, grid):
+            return lambda *args: None
+
+    monkeypatch.setattr(
+        module, "create_flashinfer_kv_indices_triton", FakeIndicesKernel()
+    )
+    updater = module.FlashInferIndicesUpdaterPrefill.__new__(
+        module.FlashInferIndicesUpdaterPrefill
+    )
+    updater.req_to_token = torch.zeros((2, 16), dtype=torch.int32)
+    updater.kv_last_page_len = torch.ones(2, dtype=torch.int32)
+    updater.num_qo_heads = updater.num_kv_heads = updater.head_dim = 1
+    updater.q_data_type = updater.data_type = torch.bfloat16
+    paged, ragged_plans = [], []
+    paged_wrapper = NS(begin_forward=lambda *a, **kw: paged.append(a))
+    ragged_wrapper = NS(begin_forward=lambda *a, **kw: ragged_plans.append(a))
+    seqs, prefixes = torch.tensor([5, 8]), torch.tensor([0, 3])
+    kv_lens = prefixes if ragged else seqs
+    kv_ptr = torch.zeros(3, dtype=torch.int32)
+    qo_ptr = torch.zeros(3, dtype=torch.int32)
+    updater.call_begin_forward(
+        ragged_wrapper,
+        paged_wrapper,
+        torch.tensor([0, 1]),
+        kv_lens,
+        int(kv_lens.sum()),
+        seqs,
+        prefixes,
+        None,
+        kv_ptr,
+        qo_ptr,
+        ragged,
+        None,
+        cpu_lengths=(seqs, [0, 3]) if cpu_metadata else None,
+    )
+    plan = paged[0]
+    assert plan[0].tolist() == [0, 5, 10]
+    assert plan[1].tolist() == ([0, 0, 3] if ragged else [0, 5, 13])
+    assert plan[3].tolist() == [1, 1]
+    assert plan[0].dtype == plan[1].dtype == plan[3].dtype == torch.int32
+    assert (plan[0].data_ptr() != qo_ptr.data_ptr()) == cpu_metadata
+    assert (plan[1].data_ptr() != kv_ptr.data_ptr()) == cpu_metadata
+    assert bool(ragged_plans) == ragged
+    if ragged:
+        assert ragged_plans[0][0] is plan[0] and ragged_plans[0][1] is plan[0]

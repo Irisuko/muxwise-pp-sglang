@@ -315,13 +315,14 @@ class TpModelWorker:
     ):
         if batch.split_forward_batch is None:
             model_worker_batch = batch.get_model_worker_batch(
-                batch.seq_lens_cpu_cache
-                if hasattr(batch, "pdmux_pp_final_indices")
-                else None
+                getattr(batch, "pdmux_pp_seq_lens_cpu", None)
             )
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
             batch.split_forward_batch = forward_batch
             forward_batch.split_index = batch.split_index
+            forward_batch.pdmux_pp_cpu_metadata = getattr(
+                batch, "pdmux_pp_cpu_metadata", False
+            )
             final_indices = getattr(batch, "pdmux_pp_final_indices", None)
             if final_indices is not None:
                 forward_batch.pdmux_pp_skip_logits = not final_indices
