@@ -373,7 +373,9 @@ class TpModelWorker:
                 # that host-to-device copy otherwise synchronizes the prefill
                 # stream and stalls CPU launch of the independent decode lane.
                 count = len(final_indices)
-                logits_output.next_token_logits = logits_output.next_token_logits[:count]
+                logits_output.next_token_logits = logits_output.next_token_logits[
+                    :count
+                ]
                 model_worker_batch.seq_lens = model_worker_batch.seq_lens[:count]
             sample_token = timer.begin("prefill_sample", []) if timer else None
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)

@@ -8,6 +8,7 @@ otherwise partitions never visited by the static warmup could never become ready
 from collections import deque
 
 import numpy as np
+
 from sglang.srt.multiplex.pp_chunk import lane_works
 
 

@@ -1,18 +1,18 @@
 """Chunk coverage, shared KV ownership and terminal-only sampling regressions."""
 
+import weakref
 from types import SimpleNamespace as NS
 from unittest.mock import patch
-import weakref
 
 import pytest
 import torch
 
-from sglang.srt.multiplex.pp_chunk import chunk_batch, lane_works, plan_chunks
 from sglang.srt.multiplex.multiplexing_pp import (
     PrefillPlan,
     PrefillWork,
     SchedulerMultiplexPPMixin,
 )
+from sglang.srt.multiplex.pp_chunk import chunk_batch, lane_works, plan_chunks
 
 
 @pytest.mark.parametrize(
@@ -29,8 +29,9 @@ def test_exact_ordered_coverage(lengths, budget):
             seen += [(i, j) for j in range(off, off + n)]
             if off + n == lengths[i]:
                 finals.append(i)
-        terminal_rows = [j for j, (i, off, n) in enumerate(chunk.spans)
-                         if off + n == lengths[i]]
+        terminal_rows = [
+            j for j, (i, off, n) in enumerate(chunk.spans) if off + n == lengths[i]
+        ]
         assert terminal_rows == list(range(len(terminal_rows)))
     assert seen == [(i, j) for i, n in enumerate(lengths) for j in range(n)]
     assert finals == list(range(len(lengths)))
@@ -203,9 +204,7 @@ def test_admission_fence_covers_child_gpu_metadata():
     assert order[-1] == ("wait", owner.event)
 
 
-@pytest.mark.parametrize(
-    "adaptive", [False, True]
-)
+@pytest.mark.parametrize("adaptive", [False, True])
 @pytest.mark.parametrize(
     "pending,credited,length,cap,allowed",
     [

@@ -1,7 +1,7 @@
 """Token-row chunking must preserve the SwiGLU map and skip ordinary decode."""
 
-from types import SimpleNamespace
 import weakref
+from types import SimpleNamespace
 
 import pytest
 import torch
