@@ -8,6 +8,8 @@ from contextlib import contextmanager
 
 import torch
 
+from sglang.srt.multiplex.pp_chunk import lane_works
+
 
 class LaneTimings:
     def __init__(self, scheduler):
@@ -52,6 +54,8 @@ class LaneTimings:
                 batch_key=id(work.batch),
                 state=work.state,
             )
+            if getattr(work, "parent_id", None) is not None:
+                fields.update(parent_batch=work.parent_id, chunk=work.chunk_index)
         elif rids is not None:
             fields["rids"] = rids
         self.request_trace.write(
@@ -105,7 +109,8 @@ class LaneTimings:
 
     def prefill_state(self):
         work = next(
-            (w for w in self.s._pp_prefills.values() if w.state != "done"), None
+            (w for w in lane_works(self.s._pp_prefills.values()) if w.state != "done"),
+            None,
         )
         phase = (
             "empty"

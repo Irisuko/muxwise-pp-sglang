@@ -466,6 +466,8 @@ class ServerArgs:
     pdmux_pp_arrival_window: float = 10.0
     pdmux_pp_summary_interval: float = 10.0
     pdmux_pp_max_inflight_prefill: Optional[int] = None
+    pdmux_pp_prefill_chunk_size: int = 0
+    pdmux_pp_max_inflight_tokens: int = 0
     pdmux_pp_radix_eviction: str = "lru"
     sm_group_num: int = 8
 
@@ -2825,6 +2827,18 @@ class ServerArgs:
             help="Maximum unmerged prefill batches in MuxWise-PP (default: pp_size).",
         )
         parser.add_argument(
+            "--pdmux-pp-prefill-chunk-size",
+            type=int,
+            default=ServerArgs.pdmux_pp_prefill_chunk_size,
+            help="MuxWise-PP pipeline prefill token budget (0 keeps whole batches).",
+        )
+        parser.add_argument(
+            "--pdmux-pp-max-inflight-tokens",
+            type=int,
+            default=ServerArgs.pdmux_pp_max_inflight_tokens,
+            help="Unfinished prefill token cap; 0 uses the batch-count cap.",
+        )
+        parser.add_argument(
             "--pdmux-pp-radix-eviction",
             choices=["lru", "fifo"],
             default="lru",
@@ -2994,6 +3008,10 @@ class ServerArgs:
             ), "Prefill MLP chunking requires pdmux without DP attention"
         if self.pdmux_pp_max_inflight_prefill is not None:
             assert self.pdmux_pp_max_inflight_prefill > 0
+        assert self.pdmux_pp_prefill_chunk_size >= 0
+        assert self.pdmux_pp_max_inflight_tokens >= 0
+        if self.pdmux_pp_prefill_chunk_size or self.pdmux_pp_max_inflight_tokens:
+            assert self.enable_pdmux and self.pp_size > 1
         if self.enable_pdmux:
             if self.pp_size > 1:
                 assert (

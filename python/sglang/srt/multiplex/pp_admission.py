@@ -56,6 +56,10 @@ class AdmissionStats:
             inflight_new_tokens=sum(
                 w.batch.extend_num_tokens for w in s._pp_prefills.values()
             ),
+            unfinished_prefill_tokens=sum(
+                w.batch.extend_num_tokens - getattr(w, "completed_tokens", 0)
+                for w in s._pp_prefills.values()
+            ),
             free_reqs=s.req_to_token_pool.available_size(),
         )
 

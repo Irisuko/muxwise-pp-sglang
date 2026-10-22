@@ -585,6 +585,10 @@ class LlamaForCausalLM(nn.Module):
                     "residual": forward_batch.residual,
                 }
             )
+        if end == self.end_layer and getattr(
+            forward_batch, "pdmux_pp_skip_logits", False
+        ):
+            return None
         if end == self.end_layer:
             timer = getattr(self, "pdmux_pp_timing", None)
             head_sample = timer.begin("prefill_head", []) if timer else None

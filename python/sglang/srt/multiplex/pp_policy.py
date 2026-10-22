@@ -8,6 +8,7 @@ otherwise partitions never visited by the static warmup could never become ready
 from collections import deque
 
 import numpy as np
+from sglang.srt.multiplex.pp_chunk import lane_works
 
 
 class OnlineRLS:
@@ -284,7 +285,8 @@ class ALPMuxPPPolicy:
 
     def _prefill_base(self):
         work = next(
-            (w for w in self.s._pp_prefills.values() if w.state != "done"), None
+            (w for w in lane_works(self.s._pp_prefills.values()) if w.state != "done"),
+            None,
         )
         if work:
             lens, past = work.batch.extend_lens, work.batch.prefix_lens

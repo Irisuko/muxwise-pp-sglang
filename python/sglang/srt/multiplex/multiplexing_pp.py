@@ -32,6 +32,12 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.pdmux_context import set_current_stream_idx
 from sglang.srt.multiplex.pp_admission import AdmissionStats
+from sglang.srt.multiplex.pp_chunk import (
+    PrefillChunk,
+    chunk_batch,
+    lane_works,
+    plan_chunks,
+)
 from sglang.srt.multiplex.pp_policy import (
     ALPMuxPPPolicy,
     balanced_assignment,
@@ -61,6 +67,7 @@ class PrefillPlan:
     # Include unsuccessful probes: match_prefix can split radix nodes.
     probes: list[tuple[str, int, int]]  # rid, fill length, prefix length
     rids: list[str]
+    chunks: list[PrefillChunk] = field(default_factory=list)
 
 
 @dataclass
@@ -154,6 +161,11 @@ class PrefillWork:
     recv_slot: Optional[int] = None
     trace_started: bool = False
     trace_slice: bool = False
+    chunks: list = field(default_factory=list)
+    parent_id: Optional[int] = None
+    chunk_index: int = 0
+    completed_tokens: int = 0
+    sampled_tokens: dict = field(default_factory=dict)
 
 
 class PrefillReceivePool:
@@ -382,6 +394,9 @@ class PrefillMailbox:
 
 
 class SchedulerMultiplexPPMixin:
+    def _pp_lane_works(self):
+        return lane_works(self._pp_prefills.values())
+
     def _pp_validate_request(self, req, recv_req):
         """Fail unsupported P1 features before allocating pools/grammar state."""
         params = req.sampling_params
@@ -582,9 +597,9 @@ class SchedulerMultiplexPPMixin:
                 len(self.stream_groups),
                 decode_bs,
                 (
-                    local_prefill_runnable(self._pp_prefills.values())
+                    local_prefill_runnable(self._pp_lane_works())
                     if self.server_args.pdmux_pp_runnable_partition
-                    else any(w.state != "done" for w in self._pp_prefills.values())
+                    else any(w.state != "done" for w in self._pp_lane_works())
                 ),
             )
         idx = self._pp_tp_broadcast(idx)
@@ -594,7 +609,7 @@ class SchedulerMultiplexPPMixin:
         ready = all(
             (w.launched is None or w.launched.is_set())
             and (w.event is None or w.event.query())
-            for w in self._pp_prefills.values()
+            for w in self._pp_lane_works()
         )
         if not self._pp_tp_all(ready):
             return
@@ -647,7 +662,19 @@ class SchedulerMultiplexPPMixin:
                 sum(w.batch.extend_num_tokens for w in self._pp_prefills.values()),
                 getattr(head, "_pp_effective_tokens", len(head.origin_input_ids)),
             )
-        if len(self._pp_prefills) >= limit:
+        token_limit = getattr(self.server_args, "pdmux_pp_max_inflight_tokens", 0)
+        unfinished = (
+            sum(
+                w.batch.extend_num_tokens - w.completed_tokens
+                for w in self._pp_prefills.values()
+            )
+            if token_limit
+            else 0
+        )
+        if token_limit and unfinished >= token_limit:
+            stats.record("inflight_tokens", tokens=unfinished, limit=token_limit)
+            return None
+        if not token_limit and len(self._pp_prefills) >= limit:
             stats.record("inflight", limit=limit, hard_limit=self._pp_max_prefills)
             return None
         extra_slot = (
@@ -720,6 +747,13 @@ class SchedulerMultiplexPPMixin:
                 reason = "inflight"
             if (
                 reason is None
+                and token_limit
+                and (unfinished or selected)
+                and unfinished + input_tokens + req.extend_input_len > token_limit
+            ):
+                reason = "inflight_tokens"
+            if (
+                reason is None
                 and selected
                 and input_tokens + req.extend_input_len > budget
             ):
@@ -739,6 +773,11 @@ class SchedulerMultiplexPPMixin:
             input_tokens += req.extend_input_len
         plan = PrefillPlan(self._pp_batch_id, probes, [r.rid for r in selected])
         if selected:
+            chunk_size = getattr(self.server_args, "pdmux_pp_prefill_chunk_size", 0)
+            if chunk_size:
+                plan.chunks = plan_chunks(
+                    [r.extend_input_len for r in selected], chunk_size
+                )
             self._pp_batch_id += 1
             self._pp_build_prefill(plan, selected)
         stats.record(reason, len(selected), **details)
@@ -786,6 +825,23 @@ class SchedulerMultiplexPPMixin:
         self._pp_prefills[plan.batch_id] = PrefillWork(
             plan, batch, "compute" if self.pp_rank == 0 else "waiting", event
         )
+        parent = self._pp_prefills[plan.batch_id]
+        for i, chunk in enumerate(plan.chunks):
+            child = chunk_batch(batch, chunk)
+            # READY uses an int64 wire ID. Reserve the low 32 bits for the
+            # chunk ordinal; parent IDs remain the ordered control identity.
+            wire_id = (plan.batch_id << 32) + i
+            child_plan = PrefillPlan(wire_id, [], [r.rid for r in child.reqs])
+            parent.chunks.append(
+                PrefillWork(
+                    child_plan,
+                    child,
+                    parent.state,
+                    event,
+                    parent_id=plan.batch_id,
+                    chunk_index=i,
+                )
+            )
         self._pp_timing.request_event(
             "admit",
             self._pp_prefills[plan.batch_id],
@@ -836,7 +892,7 @@ class SchedulerMultiplexPPMixin:
         return True
 
     def _pp_post_receives(self):
-        for work in self._pp_prefills.values():
+        for work in self._pp_lane_works():
             if work.state != "waiting":
                 continue
             envelope = self._pp_envelopes.get(work.plan.batch_id)
@@ -860,6 +916,12 @@ class SchedulerMultiplexPPMixin:
                     self.prefill_mailbox.outbox.put(envelope)
                 continue
             bid = envelope["batch_id"]
+            if envelope["kind"] == "chunk_done":
+                assert self.pp_rank == 0
+                parent = self._pp_prefills[bid]
+                parent.completed_tokens += envelope["tokens"]
+                assert parent.completed_tokens <= parent.batch.extend_num_tokens
+                continue
             if envelope["kind"] == "ready":
                 self.prefill_mailbox.ready.add(bid)
                 continue
@@ -883,7 +945,7 @@ class SchedulerMultiplexPPMixin:
         # A sent batch retains its KV ownership until the ordered MERGE.
         if getattr(self, "_pp_receive_pool", None) is not None:
             self._pp_post_receives()
-        work = next((w for w in self._pp_prefills.values() if w.state != "done"), None)
+        work = next((w for w in self._pp_lane_works() if w.state != "done"), None)
         self.split_prefill_batch = work.batch if work else None
         if work is None:
             return
@@ -927,6 +989,7 @@ class SchedulerMultiplexPPMixin:
             work.batch.split_forward_batch = None
             self._pp_release_receive(work)
             self.split_prefill_batch = None
+            self._pp_finish_chunk(work)
             return
         if work.state == "receiving":
             self._pp_timing.request_event("hidden_received", work)
@@ -987,19 +1050,47 @@ class SchedulerMultiplexPPMixin:
             work.event = self._pp_prefill_stream.record_event()
             return
         if self.pp_group.is_last_rank:
-            if self.tp_rank == 0:
+            if work.parent_id is not None:
+                parent = self._pp_prefills[work.parent_id]
+                chunk = parent.plan.chunks[work.chunk_index]
+                finals = work.batch.pdmux_pp_final_indices
+                if finals:
+                    tokens = work.tokens.tolist()
+                    assert len(tokens) == len(finals)
+                    for j, token in zip(finals, tokens):
+                        parent.sampled_tokens[chunk.spans[j][0]] = token
+                if self.tp_rank == 0:
+                    self.prefill_mailbox.outbox.put(
+                        dict(
+                            kind="chunk_done",
+                            batch_id=work.parent_id,
+                            tokens=chunk.tokens,
+                        )
+                    )
+                final = work.chunk_index == len(parent.chunks) - 1
+                if final:
+                    assert len(parent.sampled_tokens) == len(parent.batch.reqs)
+                    tokens = [
+                        parent.sampled_tokens[i] for i in range(len(parent.batch.reqs))
+                    ]
+                bid = work.parent_id
+            else:
+                final, bid = True, work.plan.batch_id
+                tokens = work.tokens.tolist() if self.tp_rank == 0 else None
+            if self.tp_rank == 0 and final:
                 self._pp_timing.request_event("result_send", work)
                 self.prefill_mailbox.outbox.put(
                     dict(
                         kind="result",
-                        batch_id=work.plan.batch_id,
-                        tokens=work.tokens.tolist(),
+                        batch_id=bid,
+                        tokens=tokens,
                     )
                 )
             work.state = "done"
             work.batch.split_forward_batch = None
             self._pp_release_receive(work)
             self.split_prefill_batch = None
+            self._pp_finish_chunk(work)
         else:
             tensors = work.proxy.tensors
             self._pp_timing.request_event("hidden_offer", work)
@@ -1020,11 +1111,37 @@ class SchedulerMultiplexPPMixin:
             # allocated its buffer. Receiver READY makes this dependency acyclic.
             work.state = "offering"
 
+    def _pp_finish_chunk(self, work):
+        if work.parent_id is not None:
+            parent = self._pp_prefills[work.parent_id]
+            if work.chunk_index == len(parent.chunks) - 1:
+                parent.state = "done"
+                parent.batch.split_prefill_finished = True
+                parent.event = work.event
+
     def _pp_merge(self, merge, mb_id):
         work = self._pp_prefills[merge["batch_id"]]
         self._pp_timing.request_event("merge", work, mb=mb_id)
         assert merge["target_mb"] == mb_id
         batch = work.batch
+        if work.chunks:
+            # A result can outrun polling of the last local send. Its launch
+            # and receive-slot fences must retire before deleting the parent.
+            for child in work.chunks:
+                if child.launched is not None:
+                    while not child.launched.wait(timeout=0.1):
+                        if not self.prefill_mailbox.errors.empty():
+                            raise RuntimeError(
+                                "Chunk send failed before MERGE"
+                            ) from self.prefill_mailbox.errors.get()
+                self._pp_decode_stream.wait_event(child.event)
+                if child.recv_slot is not None:
+                    self._pp_receive_stream.wait_event(child.event)
+                    self._pp_release_receive(child)
+                child.batch.split_forward_batch = None
+            assert all(child.batch.split_prefill_finished for child in work.chunks)
+            batch.split_prefill_finished = True
+            work.event = work.chunks[-1].event
         assert batch.split_prefill_finished
         # The last-stage result can outrun local polling of a completed send.
         # Do not delete its receive-slot owner before recording the reuse fence.

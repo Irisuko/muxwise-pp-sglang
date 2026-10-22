@@ -314,10 +314,17 @@ class TpModelWorker:
         self, batch: ScheduleBatch, pp_proxy_tensors: Optional[PPProxyTensors] = None
     ):
         if batch.split_forward_batch is None:
-            model_worker_batch = batch.get_model_worker_batch()
+            model_worker_batch = batch.get_model_worker_batch(
+                batch.seq_lens_cpu_cache
+                if hasattr(batch, "pdmux_pp_final_indices")
+                else None
+            )
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
             batch.split_forward_batch = forward_batch
             forward_batch.split_index = batch.split_index
+            final_indices = getattr(batch, "pdmux_pp_final_indices", None)
+            if final_indices is not None:
+                forward_batch.pdmux_pp_skip_logits = not final_indices
             batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
         else:
             model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)
@@ -356,6 +363,12 @@ class TpModelWorker:
             pp_proxy_tensors=pp_proxy_tensors,
         )
         if logits_output is not None and self.pp_group.is_last_rank:
+            final_indices = getattr(batch, "pdmux_pp_final_indices", None)
+            if final_indices is not None:
+                logits_output.next_token_logits = logits_output.next_token_logits[
+                    final_indices
+                ]
+                model_worker_batch.seq_lens = model_worker_batch.seq_lens[final_indices]
             sample_token = timer.begin("prefill_sample", []) if timer else None
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
             if timer:
