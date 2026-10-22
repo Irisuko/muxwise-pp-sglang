@@ -123,6 +123,63 @@ class TestProtocol(unittest.TestCase):
         pool.release(reused)
         self.assertEqual(len(pool.free), 2)
 
+    def test_single_receive_slot_applies_backpressure_until_release(self):
+        pool = PrefillReceivePool(16, 4, torch.float32, "cpu", slots=1)
+        specs = [
+            (name, (16, 4), torch.float32) for name in ("hidden_states", "residual")
+        ]
+        slot, tensors = pool.acquire(specs)
+        tensors["residual"].fill_(7)
+        self.assertIsNone(pool.acquire(specs))
+        self.assertTrue(torch.all(tensors["residual"] == 7))
+        with self.assertRaises(AssertionError):
+            pool.assert_idle()
+        pool.release(slot)
+        pool.assert_idle()
+        next_slot, next_tensors = pool.acquire(specs)
+        self.assertEqual(next_slot, slot)
+        self.assertEqual(
+            next_tensors["residual"].data_ptr(), tensors["residual"].data_ptr()
+        )
+
+    def test_stage_local_head_preserves_last_stage_and_tied_embedding(self):
+        for last in (False, True):
+            for tied in (False, True):
+                model = LlamaForCausalLM.__new__(LlamaForCausalLM)
+                nn.Module.__init__(model)
+                model.pp_group = SimpleNamespace(is_last_rank=last)
+                model.embedding = nn.Linear(4, 8, bias=False)
+                model.lm_head = model.embedding if tied else nn.Linear(4, 8, bias=False)
+                embedding, head = model.embedding, model.lm_head
+                expected = embedding.weight.detach().clone()
+                model.configure_stage_local_lm_head()
+                self.assertIs(model.embedding, embedding)
+                torch.testing.assert_close(model.embedding.weight, expected)
+                if last:
+                    self.assertIs(model.lm_head, head)
+                else:
+                    self.assertEqual(list(model.lm_head.parameters()), [])
+
+    def test_unused_head_loader_cycle_is_collected_before_capacity_probe(self):
+        import gc
+        import weakref
+
+        model = LlamaForCausalLM.__new__(LlamaForCausalLM)
+        nn.Module.__init__(model)
+        model.pp_group = SimpleNamespace(is_last_rank=False)
+        model.lm_head = nn.Linear(4, 8, bias=False)
+        # The real loader attaches a bound module method to each parameter.
+        model.lm_head.weight.weight_loader = model.lm_head.forward
+        weight = weakref.ref(model.lm_head.weight)
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            model.configure_stage_local_lm_head()
+            self.assertIsNone(weight())
+        finally:
+            if enabled:
+                gc.enable()
+
     def test_merge_releases_slot_even_before_send_polling(self):
         s = SchedulerMultiplexPPMixin()
         s.server_args = SimpleNamespace(

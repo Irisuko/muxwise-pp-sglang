@@ -157,22 +157,23 @@ class PrefillWork:
 
 
 class PrefillReceivePool:
-    """Two persistent input slots: one computing and one receiving ahead.
+    """Persistent input slots; an optional second slot receives ahead.
 
     Residuals can alias received storage throughout the layer stack, so a slot
     remains owned until the final compute/send event has completed. Preallocation
     also avoids cudaMalloc synchronizing an unmatched NCCL receive at runtime.
     """
 
-    def __init__(self, max_tokens, hidden_size, dtype, device):
+    def __init__(self, max_tokens, hidden_size, dtype, device, slots=2):
+        assert slots in (1, 2)
         self.buffers = [
             {
                 name: torch.empty((max_tokens, hidden_size), dtype=dtype, device=device)
                 for name in ("hidden_states", "residual")
             }
-            for _ in range(2)
+            for _ in range(slots)
         ]
-        self.free = deque(range(2))
+        self.free = deque(range(slots))
 
     def acquire(self, specs):
         assert {name for name, _, _ in specs} == set(self.buffers[0])
@@ -186,6 +187,9 @@ class PrefillReceivePool:
         return slot, {
             name: self.buffers[slot][name][: shape[0]] for name, shape, _ in specs
         }
+
+    def assert_idle(self):
+        assert sorted(self.free) == list(range(len(self.buffers)))
 
     def release(self, slot):
         assert 0 <= slot < len(self.buffers) and slot not in self.free
@@ -423,8 +427,9 @@ class SchedulerMultiplexPPMixin:
         # replay its complete journal before forwarding along their PP pair.
         self._pp_leader = self.pp_rank == 0 and self.tp_rank == 0
         # MistralForCausalLM inherits Llama's PP and split-prefill implementation.
-        assert (
-            self.model_config.hf_config.model_type in ("llama", "mistral")
+        assert self.model_config.hf_config.model_type in (
+            "llama",
+            "mistral",
         ), "MuxWise-PP supports Llama and Mistral"
         assert (
             type(self.tree_cache) is RadixCache
@@ -481,6 +486,10 @@ class SchedulerMultiplexPPMixin:
             from sglang.srt.multiplex.pp_profile import profile_decode
 
             self._pp_models.decode_calibration = profile_decode(self)
+        from sglang.srt.multiplex.pp_memory import install as memory_install
+        from sglang.srt.multiplex.pp_memory import record as memory_record
+
+        memory_record("calibration", pp=self.pp_rank, tp=self.tp_rank)
         self._pp_receive_pool = None
         if self.pdmux_config.pp_prefetch and self.pp_rank:
             self._pp_receive_stream = torch.cuda.Stream()
@@ -489,9 +498,11 @@ class SchedulerMultiplexPPMixin:
                 self.model_config.hidden_size,
                 self.model_config.dtype,
                 self.device,
+                slots=self.pdmux_config.pp_prefetch_slots,
             )
             logger.info(
-                "MuxWise-PP receive slots=2 reserved_MiB=%.1f",
+                "MuxWise-PP receive slots=%s reserved_MiB=%.1f",
+                len(self._pp_receive_pool.buffers),
                 sum(
                     t.numel() * t.element_size()
                     for slot in self._pp_receive_pool.buffers
@@ -516,6 +527,8 @@ class SchedulerMultiplexPPMixin:
                 self.device,
                 token_leader=self.tp_rank == 0,
             )
+        memory_record("slots", pp=self.pp_rank, tp=self.tp_rank)
+        memory_install(self.tp_worker.model_runner)
         logger.info(
             "MuxWise-PP stage=%s layers=[%s,%s) capacity=%s partitions=%s radix=%s graphs=%s",
             self.pp_rank,
@@ -1641,7 +1654,7 @@ class SchedulerMultiplexPPMixin:
                 )
                 if idle:
                     if self._pp_receive_pool is not None:
-                        assert len(self._pp_receive_pool.free) == 2
+                        self._pp_receive_pool.assert_idle()
                     with torch.cuda.stream(self._pp_decode_stream):
                         self.check_memory()
                         self.check_tree_cache()

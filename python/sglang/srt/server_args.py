@@ -435,6 +435,9 @@ class ServerArgs:
     # For PD-Multiplexing
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
+    pdmux_pp_compact_attention: bool = False
+    pdmux_pp_stage_local_lm_head: bool = False
+    pdmux_prefill_mlp_pad_to_chunk: bool = False
     pdmux_prefill_mlp_chunk_tokens: int = 0
     pdmux_pp_cpu_merge_tokens: bool = False
     pdmux_pp_lazy_admission_budget: bool = False
@@ -2638,6 +2641,21 @@ class ServerArgs:
             help="Enable PD-Multiplexing, PD running on greenctx stream.",
         )
         parser.add_argument(
+            "--pdmux-pp-compact-attention",
+            action="store_true",
+            help="Use decode-only FlashInfer backends for the MuxWise-PP decode lanes.",
+        )
+        parser.add_argument(
+            "--pdmux-pp-stage-local-lm-head",
+            action="store_true",
+            help="Release the unused output head on non-final Llama/Mistral PP stages.",
+        )
+        parser.add_argument(
+            "--pdmux-prefill-mlp-pad-to-chunk",
+            action="store_true",
+            help="Pad the last split-prefill MLP tile to the configured row count, then discard dummy rows.",
+        )
+        parser.add_argument(
             "--pdmux-prefill-mlp-chunk-tokens",
             type=int,
             default=0,
@@ -2960,6 +2978,15 @@ class ServerArgs:
         assert 0 <= self.pdmux_pp_fresh_eps <= 1
 
         # Check pdmux
+        if self.pdmux_pp_compact_attention:
+            assert self.enable_pdmux and self.pp_size > 1
+            assert self.attention_backend == "flashinfer"
+            assert self.decode_attention_backend in (None, "flashinfer")
+            assert self.prefill_attention_backend in (None, "flashinfer")
+        if self.pdmux_pp_stage_local_lm_head:
+            assert self.enable_pdmux and self.pp_size > 1
+        if self.pdmux_prefill_mlp_pad_to_chunk:
+            assert self.pdmux_prefill_mlp_chunk_tokens > 0
         assert self.pdmux_prefill_mlp_chunk_tokens >= 0
         if self.pdmux_prefill_mlp_chunk_tokens:
             assert (

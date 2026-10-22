@@ -16,9 +16,10 @@ class LinearPair(nn.Linear):
         return super().forward(x), None
 
 
+@pytest.mark.parametrize("pad", [False, True])
 @pytest.mark.parametrize("limit", [1, 4, 7, 23, 100])
 @torch.no_grad()
-def test_swiglu_math_and_intermediate_bound(limit):
+def test_swiglu_math_and_intermediate_bound(limit, pad):
     torch.manual_seed(14)
     mlp = LlamaMLP.__new__(LlamaMLP)
     nn.Module.__init__(mlp)
@@ -33,11 +34,15 @@ def test_swiglu_math_and_intermediate_bound(limit):
     expected = mlp(x, batch)
     mlp.gate_up_proj.rows.clear()
     mlp.prefill_chunk_tokens = limit
+    mlp.prefill_pad_to_chunk = pad
     actual = mlp(x, batch)
     torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
     torch.testing.assert_close(x, original, rtol=0, atol=0)
     assert max(mlp.gate_up_proj.rows) <= limit
-    assert sum(mlp.gate_up_proj.rows) == len(x)
+    if pad and len(x) > limit:
+        assert mlp.gate_up_proj.rows == [limit] * ((len(x) + limit - 1) // limit)
+    else:
+        assert sum(mlp.gate_up_proj.rows) == len(x)
     mlp.gate_up_proj.rows.clear()
     batch.forward_mode = ForwardMode.DECODE
     torch.testing.assert_close(mlp(x, batch), expected, rtol=0, atol=0)

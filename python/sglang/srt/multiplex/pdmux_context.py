@@ -21,6 +21,7 @@ class PDMuxConfig:
     split_forward_token_budget: int = 65536
     decode_bs_divisor: int = 36
     pp_profile_decode: bool = False
+    pp_prefetch_slots: int = 2
     pp_prefetch: bool = False
     pp_async_decode: bool = False
 
@@ -48,6 +49,9 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
             f"but got {len(manual_divisions)}"
         )
 
+    if raw.get("pp_prefetch_slots", 2) not in (1, 2):
+        raise ValueError("pp_prefetch_slots must be 1 or 2")
+
     return PDMuxConfig(
         sm_group_num=raw["sm_group_num"],
         manual_divisions=manual_divisions,
@@ -55,6 +59,7 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         decode_bs_divisor=raw.get("decode_bs_divisor", 36),
         pp_profile_decode=raw.get("pp_profile_decode", False),
         pp_prefetch=raw.get("pp_prefetch", False),
+        pp_prefetch_slots=raw.get("pp_prefetch_slots", 2),
         pp_async_decode=raw.get("pp_async_decode", False),
     )
 

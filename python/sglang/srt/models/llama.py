@@ -91,6 +91,7 @@ class LlamaMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.prefill_chunk_tokens = 0
+        self.prefill_pad_to_chunk = False
 
     def forward(
         self,
@@ -113,8 +114,16 @@ class LlamaMLP(nn.Module):
             output = torch.empty_like(x)
             for start in range(0, x.shape[0], limit):
                 end = min(start + limit, x.shape[0])
+                chunk = x[start:end]
+                if getattr(self, "prefill_pad_to_chunk", False) and end - start < limit:
+                    # A short tail can select a different BF16 GEMM reduction
+                    # kernel. Keep its GEMM shape equal to the full tiles. The
+                    # dummy rows are independent and never enter attention/KV.
+                    padded = x.new_zeros((limit, x.shape[1]))
+                    padded[: end - start].copy_(chunk)
+                    chunk = padded
                 output[start:end].copy_(
-                    self._forward_mlp(x[start:end], use_reduce_scatter)
+                    self._forward_mlp(chunk, use_reduce_scatter)[: end - start]
                 )
             return output
         return self._forward_mlp(x, use_reduce_scatter)
@@ -471,10 +480,23 @@ class LlamaForCausalLM(nn.Module):
 
         self.capture_aux_hidden_states = False
 
-    def configure_prefill_mlp_chunking(self, tokens):
+    def configure_stage_local_lm_head(self):
+        # Only the final stage calls logits_processor. Keeping an unused head
+        # on earlier stages needlessly limits the common KV capacity. Do this
+        # after loading so checkpoint/tied-embedding loaders stay unchanged.
+        if not self.pp_group.is_last_rank:
+            self.lm_head = PPMissingLayer()
+            # Weight-loader bound methods can form module/parameter cycles.
+            # Reclaim them before the KV-capacity memory probe.
+            import gc
+
+            gc.collect()
+
+    def configure_prefill_mlp_chunking(self, tokens, pad_to_chunk=False):
         assert tokens >= 0
         for index in range(self.start_layer, self.end_layer):
             self.model.layers[index].mlp.prefill_chunk_tokens = tokens
+            self.model.layers[index].mlp.prefill_pad_to_chunk = pad_to_chunk
 
     def _init_model(
         self,

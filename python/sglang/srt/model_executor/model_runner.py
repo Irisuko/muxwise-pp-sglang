@@ -419,6 +419,9 @@ class ModelRunner:
 
             enable_batch_invariant_mode()
 
+        from sglang.srt.multiplex.pp_memory import record as memory_record
+
+        memory_record("weights", pp=self.pp_rank, tp=self.tp_rank)
         # Init memory pool and attention backends
         self.init_memory_pool(
             min_per_gpu_memory,
@@ -426,9 +429,12 @@ class ModelRunner:
             server_args.max_total_tokens,
         )
         if self.device == "cuda":
+            memory_record("kv", pp=self.pp_rank, tp=self.tp_rank)
             self.init_cublas()
             self.init_attention_backend()
+            memory_record("backend", pp=self.pp_rank, tp=self.tp_rank)
             self.init_device_graphs()
+            memory_record("graphs", pp=self.pp_rank, tp=self.tp_rank)
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
@@ -436,6 +442,10 @@ class ModelRunner:
             self.graph_runner = None
             self.graph_mem_usage = 0
             self.init_attention_backend()
+
+        from sglang.srt.multiplex.pp_numeric import install as numeric_install
+
+        numeric_install(self)
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -779,13 +789,22 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
+        if self.server_args.pdmux_pp_stage_local_lm_head:
+            configure = getattr(self.model, "configure_stage_local_lm_head", None)
+            if configure is None:
+                raise ValueError("This model does not support stage-local output heads")
+            configure()
+
         if self.server_args.pdmux_prefill_mlp_chunk_tokens:
             configure = getattr(self.model, "configure_prefill_mlp_chunking", None)
             if configure is None:
                 raise ValueError(
                     "This model does not support split-prefill MLP token chunking"
                 )
-            configure(self.server_args.pdmux_prefill_mlp_chunk_tokens)
+            configure(
+                self.server_args.pdmux_prefill_mlp_chunk_tokens,
+                pad_to_chunk=self.server_args.pdmux_prefill_mlp_pad_to_chunk,
+            )
             logger.info(
                 "Split-prefill MLP chunk tokens=%s",
                 self.server_args.pdmux_prefill_mlp_chunk_tokens,
@@ -1720,7 +1739,17 @@ class ModelRunner:
             self.attn_backend = self._get_attention_backend(init_new_workspace=True)
             self.decode_attn_backend_group = []
             for _ in range(self.server_args.sm_group_num):
-                self.decode_attn_backend_group.append(self._get_attention_backend())
+                if self.server_args.pdmux_pp_compact_attention:
+                    from sglang.srt.layers.attention.flashinfer_backend import (
+                        FlashInferAttnBackend,
+                    )
+
+                    # These lanes only execute decode. The separate prefill
+                    # backend still owns all full-request attention metadata.
+                    backend = FlashInferAttnBackend(self, skip_prefill=True)
+                else:
+                    backend = self._get_attention_backend()
+                self.decode_attn_backend_group.append(backend)
             self.decode_attn_backend = self.decode_attn_backend_group[0]
         elif self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
