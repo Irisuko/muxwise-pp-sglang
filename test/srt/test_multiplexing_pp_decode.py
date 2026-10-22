@@ -115,7 +115,13 @@ def _rank_test(rank, path, tp_size=1):
                 tensors = {k: t + pp_rank * 10 for k, t in received.payload.items()}
                 transport.release_proxy(mb)
             if pp_rank < size - 1:
-                transport.send_proxy(mb, tensors)
+                # CUDA graph outputs retain their captured shape. Receivers
+                # still expect the actual size advertised by the control.
+                tensors = {
+                    k: torch.cat((v, torch.full((4 - bs, 8), -999.0)))
+                    for k, v in tensors.items()
+                }
+                transport.send_proxy(mb, tensors, bs)
             elif tp_rank == 0:
                 transport.send_tokens(
                     step, mb, tensors["hidden_states"][:, 0].to(torch.int64), True

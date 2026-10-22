@@ -172,14 +172,18 @@ class AsyncDecodeTransport:
         self.rx_consumed[mb] = torch.cuda.current_stream().record_event()
         self.rx_free[mb].set()
 
-    def send_proxy(self, mb, tensors):
+    def send_proxy(self, mb, tensors, batch_size):
         if self.tx_work[mb] is not None:
             self.tx_work[mb].wait(self.check)  # Only before this slot is overwritten.
-        bs = tensors["hidden_states"].shape[0]
+        # Graph replay returns its padded batch (e.g. 4 rows for 2 requests),
+        # while the receiver allocates packet.decode_bs rows. NCCL send/recv
+        # counts must match, so copy only the real microbatch into the TX slot.
+        bs = batch_size
         assert 0 < bs <= self.max_bs and set(tensors) == set(self.tx_slots[mb])
+        assert all(t.shape[0] >= bs for t in tensors.values())
         payload = {k: t[:bs] for k, t in self.tx_slots[mb].items()}
         for key, dest in payload.items():
-            dest.copy_(tensors[key])
+            dest.copy_(tensors[key][:bs])
         ready = torch.cuda.current_stream().record_event()
         transfer = self.tx_work[mb] = P2PWork(payload)
         self._put(self.sends, (transfer, ready))

@@ -1571,7 +1571,9 @@ class SchedulerMultiplexPPMixin:
                                     )
                                 elif not self.pp_group.is_last_rank:
                                     transport.send_proxy(
-                                        mb_id, result.pp_hidden_states_proxy_tensors
+                                        mb_id,
+                                        result.pp_hidden_states_proxy_tensors,
+                                        self.cur_batch.batch_size(),
                                     )
                                 if self.pp_rank:
                                     # Residual may alias the receive slot; include
