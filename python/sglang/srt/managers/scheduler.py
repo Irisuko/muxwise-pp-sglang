@@ -1731,14 +1731,17 @@ class Scheduler(
             # Move the chunked request out of the batch so that we can merge
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
-            self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
-            # chunked request keeps its rid but will get a new req_pool_idx
-            if self.tp_worker.worker.model_runner.is_hybrid_gdn:
-                self.req_to_token_pool.free(
-                    self.chunked_req.req_pool_idx, free_mamba_cache=False
-                )
-            else:
-                self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+            if self.chunked_req.req_pool_idx is not None:
+                self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
+                # A chunk deferred for KV capacity has no new request slot yet.
+                # Cache and release the previous chunk exactly once.
+                if self.tp_worker.worker.model_runner.is_hybrid_gdn:
+                    self.req_to_token_pool.free(
+                        self.chunked_req.req_pool_idx, free_mamba_cache=False
+                    )
+                else:
+                    self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+                self.chunked_req.req_pool_idx = None
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             if self.last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
