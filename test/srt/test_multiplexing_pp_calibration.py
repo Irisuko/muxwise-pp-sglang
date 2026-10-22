@@ -4,6 +4,8 @@ import math
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from sglang.srt.multiplex.pp_policy import calibrated_decode_time, choose_partition
 from sglang.srt.multiplex.pp_timing import LaneTimings
 
@@ -100,6 +102,32 @@ def test_profile_ragged_contexts_stay_in_pool_bounds_and_preserve_work():
                 assert len(shape) == bs
                 assert sum(shape) == bs * context
                 assert min(shape) >= 1 and max(shape) <= 33792
+
+
+def test_optional_context_grid_preserves_v4_and_refines_upper_bounds():
+    from sglang.srt.multiplex.pp_profile import decode_context_grid
+
+    assert decode_context_grid(33792) == [2048, 4096, 8192, 16384, 33792]
+    assert decode_context_grid(32768) == [2048, 4096, 8192, 16384, 32768]
+    grid = decode_context_grid(32768, [12288, 24576, 40000, 12288])
+    assert grid == [2048, 4096, 8192, 12288, 16384, 24576, 32768]
+    rows = [(4, c, c / 1e6) for c in grid]
+    assert calibrated_decode_time(rows, 3, 17000) == 0.024576
+    assert math.isinf(calibrated_decode_time(rows, 3, 32769))
+
+
+@pytest.mark.parametrize("invalid", [[0], [-1], [True], [1.5], "24576"])
+def test_extra_profile_contexts_reject_invalid_lengths(tmp_path, invalid):
+    import yaml
+
+    from sglang.srt.multiplex.pdmux_context import load_pdmux_config
+
+    path = tmp_path / "profile.yml"
+    path.write_text(
+        yaml.safe_dump(dict(sm_group_num=8, pp_decode_extra_contexts=invalid))
+    )
+    with pytest.raises(ValueError, match="positive integers"):
+        load_pdmux_config(str(path))
 
 
 def test_endpoint_transition_counts_gpu_time_without_poisoning_rls():

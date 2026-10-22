@@ -28,6 +28,18 @@ def context_shapes(bs, mean_context, max_context):
     return [uniform] if uniform == skewed else [uniform, skewed]
 
 
+def decode_context_grid(max_context, extra_contexts=()):
+    """Refine measured upper corners without removing the legacy coverage.
+
+    Empty extras preserve the v4 grid exactly. Long contexts between 16k and
+    32k can otherwise pay the full 32k estimate even when KV is scarce; extra
+    measured points reduce that rounding without interpolation or extrapolation.
+    """
+    return sorted(
+        {min(c, max_context) for c in (2048, 4096, 8192, 16384, 33792, *extra_contexts)}
+    )
+
+
 def profile_decode(scheduler, max_seconds=55):
     runner = scheduler.tp_worker.model_runner
     graph = runner.graph_runner
@@ -46,11 +58,9 @@ def profile_decode(scheduler, max_seconds=55):
             ]
         )
     )
-    contexts = sorted(
-        set(
-            min(c, scheduler.model_config.context_len)
-            for c in (2048, 4096, 8192, 16384, 33792)
-        )
+    contexts = decode_context_grid(
+        scheduler.model_config.context_len,
+        scheduler.pdmux_config.pp_decode_extra_contexts,
     )
     mapping = runner.req_to_token_pool.req_to_token
     width = max(contexts)

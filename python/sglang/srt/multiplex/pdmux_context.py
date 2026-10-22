@@ -21,6 +21,7 @@ class PDMuxConfig:
     split_forward_token_budget: int = 65536
     decode_bs_divisor: int = 36
     pp_profile_decode: bool = False
+    pp_decode_extra_contexts: List[int] = field(default_factory=list)
     pp_prefetch_slots: int = 2
     pp_prefetch: bool = False
     pp_async_decode: bool = False
@@ -51,6 +52,11 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
 
     if raw.get("pp_prefetch_slots", 2) not in (1, 2):
         raise ValueError("pp_prefetch_slots must be 1 or 2")
+    extra_contexts = raw.get("pp_decode_extra_contexts", [])
+    if not isinstance(extra_contexts, list) or any(
+        type(c) is not int or c <= 0 for c in extra_contexts
+    ):
+        raise ValueError("pp_decode_extra_contexts must be a list of positive integers")
 
     return PDMuxConfig(
         sm_group_num=raw["sm_group_num"],
@@ -58,6 +64,7 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         split_forward_token_budget=raw.get("split_forward_token_budget", 65536),
         decode_bs_divisor=raw.get("decode_bs_divisor", 36),
         pp_profile_decode=raw.get("pp_profile_decode", False),
+        pp_decode_extra_contexts=extra_contexts,
         pp_prefetch=raw.get("pp_prefetch", False),
         pp_prefetch_slots=raw.get("pp_prefetch_slots", 2),
         pp_async_decode=raw.get("pp_async_decode", False),
