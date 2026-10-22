@@ -145,6 +145,44 @@ def test_sampling_uses_only_terminal_rows_and_absolute_positions():
     assert ids.tolist() == [7]
 
 
+def test_admission_fence_covers_child_gpu_metadata():
+    order = []
+
+    def record():
+        event = len(order)
+        order.append(("record", event))
+        return event
+
+    req = NS(rid="r", prefix_indices=[])
+    parent_batch = NS(reqs=[req], extend_num_tokens=8, prepare_for_extend=lambda: None)
+    s = SchedulerMultiplexPPMixin()
+    s.pp_rank = 0
+    s._pp_prefills = {}
+    s._pp_cached_tokens = 0
+    s.waiting_queue = [req]
+    s.req_to_token_pool = s.token_to_kv_pool_allocator = s.tree_cache = None
+    s.model_config = s.spec_algorithm = None
+    s.tp_worker = NS(model_runner=NS(model=NS(start_layer=0)))
+    s._pp_decode_stream = NS(record_event=record)
+    s._pp_prefill_stream = NS(wait_event=lambda e: order.append(("wait", e)))
+    s._pp_timing = NS(request_event=lambda *a, **kw: None)
+    plan = PrefillPlan(7, [], ["r"], plan_chunks([8], 4))
+
+    def child(*args):
+        order.append(("child_metadata", None))
+        return NS(reqs=[req])
+
+    with patch(
+        "sglang.srt.multiplex.multiplexing_pp.ScheduleBatch.init_new",
+        return_value=parent_batch,
+    ), patch("sglang.srt.multiplex.multiplexing_pp.chunk_batch", side_effect=child):
+        s._pp_build_prefill(plan, [req])
+    owner = s._pp_prefills[7]
+    assert all(c.event == owner.event for c in owner.chunks)
+    assert owner.event > max(i for i, v in enumerate(order) if v[0] == "child_metadata")
+    assert order[-1] == ("wait", owner.event)
+
+
 @pytest.mark.parametrize(
     "pending,credited,length,cap,allowed",
     [
