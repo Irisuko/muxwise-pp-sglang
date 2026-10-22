@@ -243,7 +243,7 @@ class LlamaAttention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         rows = hidden_states.shape[0]
-        tile = self.prefill_projection_pad_to
+        tile = getattr(self, "prefill_projection_pad_to", 0)
         pad = (
             0 < rows < tile
             and forward_batch.forward_mode.is_split_prefill()

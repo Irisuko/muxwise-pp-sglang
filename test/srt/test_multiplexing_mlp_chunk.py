@@ -124,7 +124,6 @@ def test_projection_padding_never_adds_attention_queries(full_tokens, mode):
     layer.rotary_emb, layer.attn = rope, attention
     batch = SimpleNamespace(forward_mode=mode, pdmux_pp_full_prefill_tokens=full_tokens)
     inputs, positions = torch.randn(3, 5, dtype=torch.float64), torch.arange(16, 19)
-    layer.prefill_projection_pad_to = 0
     expected = layer(positions, inputs, batch)
     layer.qkv_proj.rows.clear()
     layer.o_proj.rows.clear()
