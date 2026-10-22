@@ -679,7 +679,8 @@ class SchedulerMultiplexPPMixin:
             stats.record("inflight", limit=limit, hard_limit=self._pp_max_prefills)
             return None
         extra_slot = (
-            self.server_args.pdmux_pp_adaptive_inflight
+            not token_limit
+            and self.server_args.pdmux_pp_adaptive_inflight
             and len(self._pp_prefills) >= (3 * self.pp_size + 1) // 2
         )
         budget = self._pp_admission_budget

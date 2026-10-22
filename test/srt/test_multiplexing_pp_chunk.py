@@ -195,6 +195,9 @@ def test_admission_fence_covers_child_gpu_metadata():
 
 
 @pytest.mark.parametrize(
+    "adaptive", [False, True]
+)
+@pytest.mark.parametrize(
     "pending,credited,length,cap,allowed",
     [
         (12, 0, 1, 13, True),
@@ -202,10 +205,11 @@ def test_admission_fence_covers_child_gpu_metadata():
         (12, 4, 4, 12, True),
         (0, 0, 20, 8, True),
         (1, 0, 20, 8, False),
+        (1, 0, 20, 64, True),
     ],
 )
 def test_token_admission_cap_and_oversized_fcfs_head(
-    pending, credited, length, cap, allowed
+    pending, credited, length, cap, allowed, adaptive
 ):
     from sglang.srt.multiplex.pp_admission import AdmissionStats
 
@@ -213,7 +217,7 @@ def test_token_admission_cap_and_oversized_fcfs_head(
     s.pp_size, s._pp_max_prefills, s._pp_admission_budget, s._pp_batch_id = 2, 1, 16, 9
     s.max_running_requests = 128
     s.server_args = NS(
-        pdmux_pp_adaptive_inflight=False,
+        pdmux_pp_adaptive_inflight=adaptive,
         pdmux_pp_reserve_decode=True,
         pdmux_pp_balance_merge=True,
         max_micro_batch_size=None,
@@ -238,6 +242,13 @@ def test_token_admission_cap_and_oversized_fcfs_head(
         if pending
         else {}
     )
+    if adaptive and pending:
+        # Completed parents can still own KV while waiting for MERGE. Their
+        # batch count must not restore the old gate when token credits are on.
+        for key in (1, 2):
+            s._pp_prefills[key] = NS(
+                batch=NS(reqs=[], extend_num_tokens=1), completed_tokens=1
+            )
     s.mux_pp_policy = NS(merge_target=lambda _: 0)
     s.req_to_token_pool = NS(available_size=lambda: 128)
     s.token_to_kv_pool_allocator = NS(available_size=lambda: 10000)
