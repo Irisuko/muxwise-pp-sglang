@@ -365,10 +365,13 @@ class TpModelWorker:
         if logits_output is not None and self.pp_group.is_last_rank:
             final_indices = getattr(batch, "pdmux_pp_final_indices", None)
             if final_indices is not None:
-                logits_output.next_token_logits = logits_output.next_token_logits[
-                    final_indices
-                ]
-                model_worker_batch.seq_lens = model_worker_batch.seq_lens[final_indices]
+                # FCFS chunks finish a prefix of their request spans. Basic
+                # slicing avoids constructing a CUDA index from a Python list:
+                # that host-to-device copy otherwise synchronizes the prefill
+                # stream and stalls CPU launch of the independent decode lane.
+                count = len(final_indices)
+                logits_output.next_token_logits = logits_output.next_token_logits[:count]
+                model_worker_batch.seq_lens = model_worker_batch.seq_lens[:count]
             sample_token = timer.begin("prefill_sample", []) if timer else None
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
             if timer:

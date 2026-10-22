@@ -68,6 +68,11 @@ def chunk_batch(parent, chunk):
         for j, (i, off, n) in enumerate(chunk.spans)
         if off + n == parent.extend_lens[i]
     ]
+    # FCFS packing can leave only the last span unfinished. Terminal logits
+    # are therefore a prefix, so sampling can use allocation-free GPU views.
+    assert batch.pdmux_pp_final_indices == list(
+        range(len(batch.pdmux_pp_final_indices))
+    )
     # Only terminal request spans are sampled. Intermediate chunks neither
     # consume RNG nor update penalties, and an all-intermediate chunk skips head.
     final_batch = copy.copy(batch)

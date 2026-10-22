@@ -29,6 +29,9 @@ def test_exact_ordered_coverage(lengths, budget):
             seen += [(i, j) for j in range(off, off + n)]
             if off + n == lengths[i]:
                 finals.append(i)
+        terminal_rows = [j for j, (i, off, n) in enumerate(chunk.spans)
+                         if off + n == lengths[i]]
+        assert terminal_rows == list(range(len(terminal_rows)))
     assert seen == [(i, j) for i, n in enumerate(lengths) for j in range(n)]
     assert finals == list(range(len(lengths)))
 
@@ -137,15 +140,19 @@ def test_sampling_uses_only_terminal_rows_and_absolute_positions():
         split_forward_batch=None,
         split_index=0,
         split_forward_count=4,
-        pdmux_pp_final_indices=[1],
+        pdmux_pp_final_indices=[0],
         seq_lens_cpu_cache=torch.tensor([13, 31]),
         get_model_worker_batch=lambda *_: metadata,
     )
     logits = NS(next_token_logits=torch.arange(8).view(2, 4))
+    logits_storage = logits.next_token_logits.untyped_storage().data_ptr()
+    positions_storage = metadata.seq_lens.untyped_storage().data_ptr()
 
     def sample(output, mwb):
-        assert output.next_token_logits.tolist() == [[4, 5, 6, 7]]
-        assert mwb.seq_lens.tolist() == [31]
+        assert output.next_token_logits.tolist() == [[0, 1, 2, 3]]
+        assert mwb.seq_lens.tolist() == [13]
+        assert output.next_token_logits.untyped_storage().data_ptr() == logits_storage
+        assert mwb.seq_lens.untyped_storage().data_ptr() == positions_storage
         return torch.tensor([7])
 
     worker.model_runner = NS(forward=lambda *a, **kw: (logits, False), sample=sample)
