@@ -843,6 +843,15 @@ class SchedulerMultiplexPPMixin:
                     chunk_index=i,
                 )
             )
+        if parent.chunks:
+            # Child sequence lengths and sampling tensors were allocated on
+            # the control/decode stream after the parent's allocation fence.
+            # Prefill must also wait for those copies before planning attention.
+            event = self._pp_decode_stream.record_event()
+            self._pp_prefill_stream.wait_event(event)
+            parent.event = event
+            for child in parent.chunks:
+                child.event = event
         self._pp_timing.request_event(
             "admit",
             self._pp_prefills[plan.batch_id],
