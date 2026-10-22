@@ -775,7 +775,7 @@ class SchedulerMultiplexPPMixin:
         plan = PrefillPlan(self._pp_batch_id, probes, [r.rid for r in selected])
         if selected:
             chunk_size = getattr(self.server_args, "pdmux_pp_prefill_chunk_size", 0)
-            if chunk_size:
+            if chunk_size and input_tokens > chunk_size:
                 plan.chunks = plan_chunks(
                     [r.extend_input_len for r in selected], chunk_size
                 )
@@ -829,9 +829,9 @@ class SchedulerMultiplexPPMixin:
         parent = self._pp_prefills[plan.batch_id]
         for i, chunk in enumerate(plan.chunks):
             child = chunk_batch(batch, chunk)
-            # READY uses an int64 wire ID. Reserve the low 32 bits for the
-            # chunk ordinal; parent IDs remain the ordered control identity.
-            wire_id = (plan.batch_id << 32) + i
+            # READY uses an int64 wire ID. Negative IDs keep chunks disjoint
+            # from small whole batches, which retain the original fast path.
+            wire_id = -((plan.batch_id << 32) + i + 1)
             child_plan = PrefillPlan(wire_id, [], [r.rid for r in child.reqs])
             parent.chunks.append(
                 PrefillWork(
