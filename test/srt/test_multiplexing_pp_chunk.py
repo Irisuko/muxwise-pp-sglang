@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace as NS
 from unittest.mock import patch
+import weakref
 
 import pytest
 import torch
@@ -33,8 +34,11 @@ def test_exact_ordered_coverage(lengths, budget):
 
 
 def test_views_preserve_full_allocation_and_request_state():
+    class Batch(NS):
+        pass
+
     reqs = [NS(rid=str(i), to_abort=False) for i in range(3)]
-    parent = NS(
+    parent = Batch(
         reqs=reqs,
         extend_lens=[3, 9, 2],
         prefix_lens=[2, 7, 0],
@@ -46,14 +50,21 @@ def test_views_preserve_full_allocation_and_request_state():
         model_config=NS(vocab_size=100),
         device="cpu",
     )
+    owners = []
+
+    def sampling(batch, _):
+        owners.append(weakref.ref(batch))
+        return [r.rid for r in batch.reqs]
+
     with patch(
         "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.from_schedule_batch",
-        side_effect=lambda batch, _: [r.rid for r in batch.reqs],
+        side_effect=sampling,
     ):
         children = [chunk_batch(parent, c) for c in plan_chunks(parent.extend_lens, 4)]
     assert [b.prefix_lens for b in children] == [[2, 7], [8], [12], [0]]
     assert [b.seq_lens.tolist() for b in children] == [[5, 8], [12], [16], [2]]
     assert [b.sampling_info for b in children] == [["0"], None, ["1"], ["2"]]
+    assert all(owner() is not None for owner in owners)
     assert torch.equal(
         torch.cat([b.out_cache_loc for b in children]), parent.out_cache_loc
     )

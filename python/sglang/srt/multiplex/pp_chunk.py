@@ -72,6 +72,10 @@ def chunk_batch(parent, chunk):
     # consume RNG nor update penalties, and an all-intermediate chunk skips head.
     final_batch = copy.copy(batch)
     final_batch.reqs = [batch.reqs[i] for i in batch.pdmux_pp_final_indices]
+    final_batch.sampling_info = None
+    # The penalizer orchestrator keeps a weak reference to its batch. Retain
+    # the terminal-request view for the entire chunk's sampling lifetime.
+    batch.pdmux_pp_sampling_batch = final_batch if final_batch.reqs else None
     batch.sampling_info = (
         SamplingBatchInfo.from_schedule_batch(
             final_batch, parent.model_config.vocab_size
