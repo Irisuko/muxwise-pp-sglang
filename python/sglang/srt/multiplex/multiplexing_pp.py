@@ -165,6 +165,7 @@ class PrefillWork:
     parent_id: Optional[int] = None
     chunk_index: int = 0
     completed_tokens: int = 0
+    acked_chunks: int = 0
     sampled_tokens: dict = field(default_factory=dict)
 
 
@@ -919,6 +920,11 @@ class SchedulerMultiplexPPMixin:
             if envelope["kind"] == "chunk_done":
                 assert self.pp_rank == 0
                 parent = self._pp_prefills[bid]
+                assert envelope["chunk_index"] == parent.acked_chunks
+                assert (
+                    envelope["tokens"] == parent.plan.chunks[parent.acked_chunks].tokens
+                )
+                parent.acked_chunks += 1
                 parent.completed_tokens += envelope["tokens"]
                 assert parent.completed_tokens <= parent.batch.extend_num_tokens
                 continue
@@ -1064,6 +1070,7 @@ class SchedulerMultiplexPPMixin:
                         dict(
                             kind="chunk_done",
                             batch_id=work.parent_id,
+                            chunk_index=work.chunk_index,
                             tokens=chunk.tokens,
                         )
                     )
