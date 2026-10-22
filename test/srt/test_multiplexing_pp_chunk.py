@@ -110,3 +110,99 @@ def test_reject_zero_budget_or_empty_request():
         plan_chunks([8], 0)
     with pytest.raises(AssertionError):
         plan_chunks([0], 8)
+
+
+def test_sampling_uses_only_terminal_rows_and_absolute_positions():
+    from sglang.srt.managers.tp_worker import TpModelWorker
+
+    worker = TpModelWorker.__new__(TpModelWorker)
+    worker.pp_group = NS(is_last_rank=True)
+    metadata = NS(
+        seq_lens=torch.tensor([13, 31]),
+        seq_lens_cpu=torch.tensor([13, 31]),
+        sampling_info=object(),
+    )
+    batch = NS(
+        split_forward_batch=None,
+        split_index=0,
+        split_forward_count=4,
+        pdmux_pp_final_indices=[1],
+        seq_lens_cpu_cache=torch.tensor([13, 31]),
+        get_model_worker_batch=lambda *_: metadata,
+    )
+    logits = NS(next_token_logits=torch.arange(8).view(2, 4))
+
+    def sample(output, mwb):
+        assert output.next_token_logits.tolist() == [[4, 5, 6, 7]]
+        assert mwb.seq_lens.tolist() == [31]
+        return torch.tensor([7])
+
+    worker.model_runner = NS(forward=lambda *a, **kw: (logits, False), sample=sample)
+    with patch(
+        "sglang.srt.managers.tp_worker.ForwardBatch.init_new", return_value=NS()
+    ):
+        _, ids, _, _ = worker.forward_batch_split_prefill(batch)
+    assert ids.tolist() == [7]
+
+
+@pytest.mark.parametrize(
+    "pending,credited,length,cap,allowed",
+    [
+        (12, 0, 1, 13, True),
+        (12, 0, 1, 12, False),
+        (12, 4, 4, 12, True),
+        (0, 0, 20, 8, True),
+        (1, 0, 20, 8, False),
+    ],
+)
+def test_token_admission_cap_and_oversized_fcfs_head(
+    pending, credited, length, cap, allowed
+):
+    from sglang.srt.multiplex.pp_admission import AdmissionStats
+
+    s = SchedulerMultiplexPPMixin()
+    s.pp_size, s._pp_max_prefills, s._pp_admission_budget, s._pp_batch_id = 2, 1, 16, 9
+    s.max_running_requests = 128
+    s.server_args = NS(
+        pdmux_pp_adaptive_inflight=False,
+        pdmux_pp_reserve_decode=True,
+        pdmux_pp_balance_merge=True,
+        max_micro_batch_size=None,
+        pdmux_pp_max_inflight_tokens=cap,
+        pdmux_pp_prefill_chunk_size=4,
+    )
+    req = NS(
+        rid="head",
+        origin_input_ids=list(range(length)),
+        fill_ids=list(range(length)),
+        prefix_indices=[],
+        last_node="node",
+        extend_input_len=length,
+        sampling_params=NS(max_new_tokens=1),
+        init_next_round_input=lambda _: None,
+    )
+    s.waiting_queue = [req]
+    s.running_mbs = [NS(reqs=[]), NS(reqs=[])]
+    s._pp_pending_merges = [[], []]
+    s._pp_prefills = (
+        {0: NS(batch=NS(reqs=[], extend_num_tokens=pending), completed_tokens=credited)}
+        if pending
+        else {}
+    )
+    s.mux_pp_policy = NS(merge_target=lambda _: 0)
+    s.req_to_token_pool = NS(available_size=lambda: 128)
+    s.token_to_kv_pool_allocator = NS(available_size=lambda: 10000)
+    locks = []
+    s.tree_cache = NS(
+        inc_lock_ref=lambda n: locks.append(1),
+        dec_lock_ref=lambda n: locks.append(-1),
+        evictable_size=lambda: 0,
+    )
+    s._pp_admission_stats = NS(
+        capacity_reason=AdmissionStats.capacity_reason, record=lambda *a, **kw: None
+    )
+    built = []
+    s._pp_build_prefill = lambda plan, reqs: built.append(plan)
+    s._pp_make_plan()
+    assert bool(built) == allowed
+    assert sum(locks) == int(allowed)
