@@ -468,6 +468,7 @@ class ServerArgs:
     pdmux_pp_max_inflight_prefill: Optional[int] = None
     pdmux_pp_prefill_chunk_size: int = 0
     pdmux_pp_max_inflight_tokens: int = 0
+    pdmux_pp_token_refill_size: int = 0
     pdmux_pp_prefill_projection_pad_to: int = 0
     pdmux_pp_radix_eviction: str = "lru"
     sm_group_num: int = 8
@@ -2846,6 +2847,12 @@ class ServerArgs:
             help="Unfinished prefill token cap; 0 uses the batch-count cap.",
         )
         parser.add_argument(
+            "--pdmux-pp-token-refill-size",
+            type=int,
+            default=ServerArgs.pdmux_pp_token_refill_size,
+            help="Wait for this many token credits before admitting another batch, bounded by the current admission budget (0 disables).",
+        )
+        parser.add_argument(
             "--pdmux-pp-radix-eviction",
             choices=["lru", "fifo"],
             default="lru",
@@ -3017,6 +3024,11 @@ class ServerArgs:
             assert self.pdmux_pp_max_inflight_prefill > 0
         assert self.pdmux_pp_prefill_chunk_size >= 0
         assert self.pdmux_pp_max_inflight_tokens >= 0
+        assert self.pdmux_pp_token_refill_size >= 0
+        if self.pdmux_pp_token_refill_size:
+            assert (
+                self.pdmux_pp_token_refill_size <= self.pdmux_pp_max_inflight_tokens
+            ), "Token refill size requires an enabled token cap at least as large"
         assert self.pdmux_pp_prefill_projection_pad_to >= 0
         if self.pdmux_pp_prefill_projection_pad_to:
             assert self.pdmux_pp_prefill_chunk_size > 0

@@ -694,6 +694,16 @@ class SchedulerMultiplexPPMixin:
         if budget <= 0:
             stats.record("budget", budget=budget)
             return None
+        refill = min(getattr(self.server_args, "pdmux_pp_token_refill_size", 0), budget)
+        if token_limit and unfinished and token_limit - unfinished < refill:
+            # A few newly returned credits can otherwise admit a tiny parent
+            # batch on every control tick. Accumulate enough for useful work;
+            # the empty-pipeline oversized-head escape and KV/output reserves
+            # remain unchanged below. This gate never waits for new arrivals.
+            stats.record(
+                "inflight_refill", tokens=unfinished, limit=token_limit, refill=refill
+            )
+            return None
         # Reserve the entire remaining output, across ALL microbatches, plus
         # pp_size-1 safety tokens. Unmerged and ready-to-join requests count too.
         active = [r for mb in self.running_mbs for r in mb.reqs if not r.finished()]

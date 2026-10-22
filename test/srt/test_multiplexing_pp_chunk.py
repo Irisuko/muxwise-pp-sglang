@@ -207,23 +207,39 @@ def test_admission_fence_covers_child_gpu_metadata():
 
 @pytest.mark.parametrize("adaptive", [False, True])
 @pytest.mark.parametrize(
-    "pending,credited,length,cap,allowed",
+    "pending,credited,length,cap,refill,budget,allowed",
     [
-        (12, 0, 1, 13, True),
-        (12, 0, 1, 12, False),
-        (12, 4, 4, 12, True),
-        (0, 0, 20, 8, True),
-        (1, 0, 20, 8, False),
-        (1, 0, 20, 64, True),
+        (12, 0, 1, 13, 0, 16, True),
+        (12, 0, 1, 12, 0, 16, False),
+        (12, 4, 4, 12, 0, 16, True),
+        (0, 0, 20, 8, 0, 16, True),
+        (1, 0, 20, 8, 0, 16, False),
+        (1, 0, 20, 64, 0, 16, True),
+        # Dribbled credits cannot create a new tiny batch until refill.
+        (12, 0, 1, 16, 8, 16, False),
+        (12, 4, 1, 16, 8, 16, True),
+        # Respect a smaller current ALP budget instead of over-waiting.
+        (12, 0, 1, 16, 8, 4, True),
+        # No pending work, including completed parents awaiting MERGE, must
+        # still allow a single oversized FCFS head to make progress.
+        (0, 0, 20, 8, 8, 16, True),
+        (12, 12, 20, 8, 8, 16, True),
+        # Passing refill does not relax the total token cap.
+        (12, 4, 20, 16, 8, 16, False),
     ],
 )
 def test_token_admission_cap_and_oversized_fcfs_head(
-    pending, credited, length, cap, allowed, adaptive
+    pending, credited, length, cap, refill, budget, allowed, adaptive
 ):
     from sglang.srt.multiplex.pp_admission import AdmissionStats
 
     s = SchedulerMultiplexPPMixin()
-    s.pp_size, s._pp_max_prefills, s._pp_admission_budget, s._pp_batch_id = 2, 1, 16, 9
+    s.pp_size, s._pp_max_prefills, s._pp_admission_budget, s._pp_batch_id = (
+        2,
+        1,
+        budget,
+        9,
+    )
     s.max_running_requests = 128
     s.server_args = NS(
         pdmux_pp_adaptive_inflight=adaptive,
@@ -231,6 +247,7 @@ def test_token_admission_cap_and_oversized_fcfs_head(
         pdmux_pp_balance_merge=True,
         max_micro_batch_size=None,
         pdmux_pp_max_inflight_tokens=cap,
+        pdmux_pp_token_refill_size=refill,
         pdmux_pp_prefill_chunk_size=4,
     )
     req = NS(
