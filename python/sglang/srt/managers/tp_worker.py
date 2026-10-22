@@ -328,6 +328,9 @@ class TpModelWorker:
                 forward_batch.pdmux_pp_full_prefill_tokens = (
                     batch.pdmux_pp_full_prefill_tokens
                 )
+                forward_batch.pdmux_pp_append_chunk = getattr(
+                    batch, "pdmux_pp_append_chunk", False
+                )
             batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
         else:
             model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)

@@ -69,6 +69,7 @@ def test_views_preserve_full_allocation_and_request_state():
     assert [b.prefix_lens for b in children] == [[2, 7], [8], [12], [0]]
     assert [b.seq_lens.tolist() for b in children] == [[5, 8], [12], [16], [2]]
     assert [b.sampling_info for b in children] == [["0"], None, ["1"], ["2"]]
+    assert [b.pdmux_pp_append_chunk for b in children] == [False, True, True, False]
     assert all(owner() is not None for owner in owners)
     assert torch.equal(
         torch.cat([b.out_cache_loc for b in children]), parent.out_cache_loc
@@ -274,3 +275,32 @@ def test_token_admission_cap_and_oversized_fcfs_head(
     s._pp_make_plan()
     assert bool(built) == allowed
     assert sum(locks) == int(allowed)
+
+
+@pytest.mark.parametrize("append,prefix", [(None, 0), (None, 5), (False, 5), (True, 5)])
+def test_append_chunk_plans_one_full_context_attention(append, prefix, monkeypatch):
+    monkeypatch.setenv("SGLANG_ENABLE_TORCH_COMPILE", "0")
+    from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    backend = FlashInferAttnBackend.__new__(FlashInferAttnBackend)
+    backend.is_multimodal = backend.enable_deterministic = False
+    backend.prefill_wrappers_paged = [object()]
+    backend.prefill_split_tile_size = None
+    plans = []
+    backend.indices_updater_prefill = NS(update=lambda *a, **kw: plans.append(kw))
+    batch = NS(
+        forward_mode=ForwardMode.SPLIT_PREFILL,
+        req_pool_indices=torch.tensor([0]),
+        seq_lens=torch.tensor([prefix + 4]),
+        seq_lens_cpu=torch.tensor([prefix + 4]),
+        seq_lens_sum=prefix + 4,
+        extend_prefix_lens=torch.tensor([prefix]),
+        extend_prefix_lens_cpu=[prefix],
+        encoder_lens=None,
+    )
+    if append is not None:
+        batch.pdmux_pp_append_chunk = append
+    backend.init_forward_metadata(batch)
+    assert plans[0]["use_ragged"] == (append is not True)
+    assert backend.forward_metadata.use_ragged == (append is not True)

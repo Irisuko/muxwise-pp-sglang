@@ -295,7 +295,13 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
-            if self.is_multimodal:
+            if self.is_multimodal or getattr(
+                forward_batch, "pdmux_pp_append_chunk", False
+            ):
+                # CPP's previous chunks are already in this stage's KV. Attend
+                # to that prefix and the current chunk in one causal kernel.
+                # Splitting them into BF16 partial outputs and merging adds a
+                # rounding boundary at each chunk, even for a cold request.
                 use_ragged = False
                 extend_no_prefix = False
             else:
