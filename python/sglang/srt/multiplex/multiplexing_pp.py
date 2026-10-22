@@ -509,16 +509,23 @@ class SchedulerMultiplexPPMixin:
         self._pp_receive_pool = None
         if self.pdmux_config.pp_prefetch and self.pp_rank:
             self._pp_receive_stream = torch.cuda.Stream()
+            receive_tokens = max(self.max_prefill_tokens, self.model_config.context_len)
+            chunk_tokens = self.server_args.pdmux_pp_prefill_chunk_size
+            if chunk_tokens:
+                # Every larger admission is split by the leader; even the
+                # unchunked fast path is bounded by this wire-token budget.
+                receive_tokens = min(receive_tokens, chunk_tokens)
             self._pp_receive_pool = PrefillReceivePool(
-                max(self.max_prefill_tokens, self.model_config.context_len),
+                receive_tokens,
                 self.model_config.hidden_size,
                 self.model_config.dtype,
                 self.device,
                 slots=self.pdmux_config.pp_prefetch_slots,
             )
             logger.info(
-                "MuxWise-PP receive slots=%s reserved_MiB=%.1f",
+                "MuxWise-PP receive slots=%s max_tokens=%s reserved_MiB=%.1f",
                 len(self._pp_receive_pool.buffers),
+                receive_tokens,
                 sum(
                     t.numel() * t.element_size()
                     for slot in self._pp_receive_pool.buffers
@@ -943,7 +950,13 @@ class SchedulerMultiplexPPMixin:
                 continue
             if self.pp_rank == 0:
                 assert envelope["kind"] == "result" and bid in self._pp_prefills
-                self._pp_timing.request_event("result_received", self._pp_prefills[bid])
+                parent = self._pp_prefills[bid]
+                if parent.chunks:
+                    assert parent.acked_chunks == len(parent.chunks)
+                    assert parent.completed_tokens == parent.batch.extend_num_tokens
+                else:
+                    parent.completed_tokens = parent.batch.extend_num_tokens
+                self._pp_timing.request_event("result_received", parent)
                 self._pp_merge_ready.append(
                     dict(
                         batch_id=bid,
