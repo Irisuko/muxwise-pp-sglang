@@ -303,4 +303,5 @@ def test_append_chunk_plans_one_full_context_attention(append, prefix, monkeypat
         batch.pdmux_pp_append_chunk = append
     backend.init_forward_metadata(batch)
     assert plans[0]["use_ragged"] == (append is not True)
+    assert plans[0]["disable_split_kv"] == (append is True)
     assert backend.forward_metadata.use_ragged == (append is not True)

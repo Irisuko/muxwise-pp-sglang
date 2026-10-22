@@ -294,10 +294,9 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
+            append_chunk = getattr(forward_batch, "pdmux_pp_append_chunk", False)
 
-            if self.is_multimodal or getattr(
-                forward_batch, "pdmux_pp_append_chunk", False
-            ):
+            if self.is_multimodal or append_chunk:
                 # CPP's previous chunks are already in this stage's KV. Attend
                 # to that prefix and the current chunk in one causal kernel.
                 # Splitting them into BF16 partial outputs and merging adds a
@@ -318,7 +317,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=None,
-                fixed_split_size=self.prefill_split_tile_size,
+                fixed_split_size=None if append_chunk else self.prefill_split_tile_size,
+                # A short query tail otherwise changes the automatic KV split
+                # and softmax reduction order relative to the full prefill.
+                disable_split_kv=append_chunk,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged, use_ragged, extend_no_prefix
@@ -945,6 +947,7 @@ class FlashInferIndicesUpdaterPrefill:
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
         fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -963,6 +966,7 @@ class FlashInferIndicesUpdaterPrefill:
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
         fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -987,6 +991,7 @@ class FlashInferIndicesUpdaterPrefill:
             use_ragged,
             spec_info,
             fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
         )
 
     def update_sliding_window(
@@ -1003,6 +1008,7 @@ class FlashInferIndicesUpdaterPrefill:
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
         fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1036,6 +1042,7 @@ class FlashInferIndicesUpdaterPrefill:
                 use_ragged,
                 spec_info,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
+                disable_split_kv=disable_split_kv,
             )
 
     def update_cross_attention(
@@ -1052,6 +1059,7 @@ class FlashInferIndicesUpdaterPrefill:
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
         fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1078,6 +1086,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.qo_indptr[wrapper_id],
                 use_ragged,
                 spec_info,
+                disable_split_kv=disable_split_kv,
             )
 
     def call_begin_forward(
@@ -1098,6 +1107,7 @@ class FlashInferIndicesUpdaterPrefill:
         ],
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1169,6 +1179,7 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask=custom_mask,
             non_blocking=True,
             fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
         )
 
 
