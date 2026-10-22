@@ -422,9 +422,10 @@ class SchedulerMultiplexPPMixin:
         # Only this rank may decide request/cache transitions. Stage0 TP peers
         # replay its complete journal before forwarding along their PP pair.
         self._pp_leader = self.pp_rank == 0 and self.tp_rank == 0
+        # MistralForCausalLM inherits Llama's PP and split-prefill implementation.
         assert (
-            self.model_config.hf_config.model_type == "llama"
-        ), "MuxWise-PP supports Llama"
+            self.model_config.hf_config.model_type in ("llama", "mistral")
+        ), "MuxWise-PP supports Llama and Mistral"
         assert (
             type(self.tree_cache) is RadixCache
         ), "MuxWise-PP requires the Python RadixCache"
