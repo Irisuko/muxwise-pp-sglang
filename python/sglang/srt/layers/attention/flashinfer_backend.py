@@ -101,6 +101,9 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
+        compact_pp = getattr(
+            model_runner.server_args, "pdmux_pp_compact_attention", False
+        )
         self.is_multimodal = model_runner.model_config.is_multimodal
 
         assert not (
@@ -195,9 +198,11 @@ class FlashInferAttnBackend(AttentionBackend):
         fmha_backend = "auto"
         if is_sm100_supported():
             fmha_backend = "cutlass"
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
-        )
+        self.prefill_wrapper_ragged = None
+        if not (compact_pp and skip_prefill):
+            self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer, "NHD", backend=fmha_backend
+            )
 
         # Two wrappers: one for sliding window attention and one for full attention.
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
@@ -213,12 +218,15 @@ class FlashInferAttnBackend(AttentionBackend):
                         backend="fa2",
                     )
                 )
-                self.prefill_wrappers_verify.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
+                # MuxWise-PP rejects speculative decoding. The unused verify
+                # wrapper otherwise retains a large vector-index workspace.
+                if not compact_pp:
+                    self.prefill_wrappers_verify.append(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                        )
                     )
-                )
             self.decode_wrappers.append(
                 BatchDecodeWithPagedKVCacheWrapper(
                     self.workspace_buffer,

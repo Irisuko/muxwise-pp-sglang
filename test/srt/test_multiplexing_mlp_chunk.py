@@ -1,6 +1,7 @@
 """Token-row chunking must preserve the SwiGLU map and skip ordinary decode."""
 
 from types import SimpleNamespace
+import weakref
 
 import pytest
 import torch
@@ -47,3 +48,27 @@ def test_swiglu_math_and_intermediate_bound(limit, pad):
     batch.forward_mode = ForwardMode.DECODE
     torch.testing.assert_close(mlp(x, batch), expected, rtol=0, atol=0)
     assert mlp.gate_up_proj.rows == [len(x)]
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@torch.no_grad()
+def test_compact_mlp_releases_gate_up_before_down_projection(compact):
+    mlp = LlamaMLP.__new__(LlamaMLP)
+    nn.Module.__init__(mlp)
+    mlp.gate_up_proj = LinearPair(8, 24, bias=False, dtype=torch.float64)
+    mlp.down_proj = LinearPair(12, 8, bias=False, dtype=torch.float64)
+    mlp.gate_up_proj.rows, mlp.down_proj.rows = [], []
+    mlp.prefill_pad_to_chunk = compact
+    gate_up_ref = None
+
+    def activate(x):
+        nonlocal gate_up_ref
+        gate_up_ref = weakref.ref(x)
+        return torch.nn.functional.silu(x[:, :12]) * x[:, 12:]
+
+    def check_lifetime(module, args):
+        assert (gate_up_ref() is None) == compact
+
+    mlp.act_fn = activate
+    mlp.down_proj.register_forward_pre_hook(check_lifetime)
+    mlp._forward_mlp(torch.randn(4, 8, dtype=torch.float64))

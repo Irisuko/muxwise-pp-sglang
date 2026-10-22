@@ -131,6 +131,10 @@ class LlamaMLP(nn.Module):
     def _forward_mlp(self, x, use_reduce_scatter=False):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
+        if getattr(self, "prefill_pad_to_chunk", False):
+            # SiluAndMul returns independent storage. Do not keep its wide input
+            # alive across the down projection in the opt-in low-memory path.
+            del gate_up
         x, _ = self.down_proj(
             x,
             skip_all_reduce=use_reduce_scatter,
