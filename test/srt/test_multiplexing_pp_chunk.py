@@ -44,6 +44,7 @@ def test_views_preserve_full_allocation_and_request_state():
     parent = Batch(
         reqs=reqs,
         extend_lens=[3, 9, 2],
+        extend_num_tokens=14,
         prefix_lens=[2, 7, 0],
         input_ids=torch.arange(14),
         out_cache_loc=torch.arange(40, 54),
@@ -141,6 +142,7 @@ def test_sampling_uses_only_terminal_rows_and_absolute_positions():
         split_index=0,
         split_forward_count=4,
         pdmux_pp_final_indices=[0],
+        pdmux_pp_full_prefill_tokens=32,
         seq_lens_cpu_cache=torch.tensor([13, 31]),
         get_model_worker_batch=lambda *_: metadata,
     )

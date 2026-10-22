@@ -102,6 +102,20 @@ class LlamaMLP(nn.Module):
         limit = self.prefill_chunk_tokens
         if (
             limit > 0
+            and x.shape[0] < limit
+            and getattr(self, "prefill_pad_to_chunk", False)
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_split_prefill()
+            and getattr(forward_batch, "pdmux_pp_full_prefill_tokens", 0) > limit
+        ):
+            # Pipeline chunking moves a large prefill's short MLP tail into
+            # its own forward. Preserve the configured tail GEMM shape even
+            # though this individual forward no longer exceeds the MLP limit.
+            padded = x.new_zeros((limit, x.shape[1]))
+            padded[: x.shape[0]].copy_(x)
+            return self._forward_mlp(padded, use_reduce_scatter)[: x.shape[0]]
+        if (
+            limit > 0
             and x.shape[0] > limit
             and forward_batch is not None
             and forward_batch.forward_mode.is_split_prefill()

@@ -325,6 +325,9 @@ class TpModelWorker:
             final_indices = getattr(batch, "pdmux_pp_final_indices", None)
             if final_indices is not None:
                 forward_batch.pdmux_pp_skip_logits = not final_indices
+                forward_batch.pdmux_pp_full_prefill_tokens = (
+                    batch.pdmux_pp_full_prefill_tokens
+                )
             batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
         else:
             model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)

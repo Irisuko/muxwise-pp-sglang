@@ -59,6 +59,7 @@ def chunk_batch(parent, chunk):
     batch.seq_lens_cpu_cache = torch.tensor(lengths, dtype=torch.int64)
     batch.seq_lens_sum = sum(lengths)
     batch.extend_num_tokens = chunk.tokens
+    batch.pdmux_pp_full_prefill_tokens = parent.extend_num_tokens
     batch.extend_logprob_start_lens = [0] * len(batch.reqs)
     batch.multimodal_inputs = parent.multimodal_inputs[first:last]
     batch.split_forward_batch = None

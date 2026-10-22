@@ -72,3 +72,28 @@ def test_compact_mlp_releases_gate_up_before_down_projection(compact):
     mlp.act_fn = activate
     mlp.down_proj.register_forward_pre_hook(check_lifetime)
     mlp._forward_mlp(torch.randn(4, 8, dtype=torch.float64))
+
+
+@pytest.mark.parametrize("pad", [False, True])
+@pytest.mark.parametrize("full_tokens", [0, 3, 19])
+@pytest.mark.parametrize("mode", [ForwardMode.SPLIT_PREFILL, ForwardMode.DECODE])
+@torch.no_grad()
+def test_pipeline_tail_retains_full_prefill_mlp_padding(pad, full_tokens, mode):
+    mlp = LlamaMLP.__new__(LlamaMLP)
+    nn.Module.__init__(mlp)
+    mlp.prefill_chunk_tokens = 8
+    mlp.prefill_pad_to_chunk = pad
+    rows = []
+
+    def mlp_rows(x, _):
+        rows.append(len(x))
+        if len(x) > 3:
+            assert not torch.count_nonzero(x[3:])
+        return x * 2
+
+    mlp._forward_mlp = mlp_rows
+    x = torch.randn(3, 5)
+    batch = SimpleNamespace(forward_mode=mode, pdmux_pp_full_prefill_tokens=full_tokens)
+    torch.testing.assert_close(mlp(x, batch), 2 * x, rtol=0, atol=0)
+    padded = pad and full_tokens > 8 and mode == ForwardMode.SPLIT_PREFILL
+    assert rows == [8 if padded else 3]
