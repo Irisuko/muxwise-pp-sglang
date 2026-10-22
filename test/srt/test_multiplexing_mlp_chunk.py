@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.models.llama import LlamaMLP
+from sglang.srt.models.llama import LlamaAttention, LlamaMLP
 
 
 class LinearPair(nn.Linear):
@@ -97,3 +97,39 @@ def test_pipeline_tail_retains_full_prefill_mlp_padding(pad, full_tokens, mode):
     torch.testing.assert_close(mlp(x, batch), 2 * x, rtol=0, atol=0)
     padded = pad and full_tokens > 8 and mode == ForwardMode.SPLIT_PREFILL
     assert rows == [8 if padded else 3]
+
+
+@pytest.mark.parametrize("full_tokens", [0, 3, 19])
+@pytest.mark.parametrize(
+    "mode", [ForwardMode.SPLIT_PREFILL, ForwardMode.EXTEND, ForwardMode.DECODE]
+)
+@torch.no_grad()
+def test_projection_padding_never_adds_attention_queries(full_tokens, mode):
+    layer = LlamaAttention.__new__(LlamaAttention)
+    nn.Module.__init__(layer)
+    layer.qkv_proj = LinearPair(5, 8, bias=False, dtype=torch.float64)
+    layer.o_proj = LinearPair(4, 5, bias=False, dtype=torch.float64)
+    layer.qkv_proj.rows, layer.o_proj.rows = [], []
+    layer.q_size, layer.kv_size = 4, 2
+
+    def rope(positions, q, k):
+        assert positions.tolist() == [16, 17, 18]
+        assert len(q) == len(k) == 3
+        return q, k
+
+    def attention(q, k, v, _):
+        assert len(q) == len(k) == len(v) == 3
+        return q + torch.cat([k + v, k + v], dim=1)
+
+    layer.rotary_emb, layer.attn = rope, attention
+    batch = SimpleNamespace(forward_mode=mode, pdmux_pp_full_prefill_tokens=full_tokens)
+    inputs, positions = torch.randn(3, 5, dtype=torch.float64), torch.arange(16, 19)
+    layer.prefill_projection_pad_to = 0
+    expected = layer(positions, inputs, batch)
+    layer.qkv_proj.rows.clear()
+    layer.o_proj.rows.clear()
+    layer.prefill_projection_pad_to = 8
+    actual = layer(positions, inputs, batch)
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    padded = full_tokens > 8 and mode == ForwardMode.SPLIT_PREFILL
+    assert layer.qkv_proj.rows == layer.o_proj.rows == [8 if padded else 3]

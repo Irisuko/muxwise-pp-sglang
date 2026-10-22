@@ -810,6 +810,12 @@ class ModelRunner:
                 self.server_args.pdmux_prefill_mlp_chunk_tokens,
             )
 
+        if self.server_args.pdmux_pp_prefill_projection_pad_to:
+            configure = getattr(self.model, "configure_pp_projection_padding", None)
+            if configure is None:
+                raise ValueError("This model does not support CPP projection padding")
+            configure(self.server_args.pdmux_pp_prefill_projection_pad_to)
+
         get_offloader().post_init()
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":

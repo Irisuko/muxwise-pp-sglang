@@ -234,6 +234,7 @@ class LlamaAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
+        self.prefill_projection_pad_to = 0
 
     def forward(
         self,
@@ -241,11 +242,33 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        rows = hidden_states.shape[0]
+        tile = self.prefill_projection_pad_to
+        pad = (
+            0 < rows < tile
+            and forward_batch.forward_mode.is_split_prefill()
+            and getattr(forward_batch, "pdmux_pp_full_prefill_tokens", 0) > tile
+        )
+        if pad:
+            # Like the MLP tail, a small CPP projection can select a different
+            # BF16 GEMM reduction. Dummy rows stay inside the linear maps and
+            # never reach RoPE, attention, or KV allocation.
+            padded = hidden_states.new_zeros((tile, hidden_states.shape[1]))
+            padded[:rows].copy_(hidden_states)
+            qkv, _ = self.qkv_proj(padded)
+            qkv = qkv[:rows]
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        if pad:
+            padded = attn_output.new_zeros((tile, attn_output.shape[1]))
+            padded[:rows].copy_(attn_output)
+            output, _ = self.o_proj(padded)
+            output = output[:rows]
+        else:
+            output, _ = self.o_proj(attn_output)
         return output
 
 
@@ -515,6 +538,11 @@ class LlamaForCausalLM(nn.Module):
         for index in range(self.start_layer, self.end_layer):
             self.model.layers[index].mlp.prefill_chunk_tokens = tokens
             self.model.layers[index].mlp.prefill_pad_to_chunk = pad_to_chunk
+
+    def configure_pp_projection_padding(self, tokens):
+        assert tokens >= 0
+        for index in range(self.start_layer, self.end_layer):
+            self.model.layers[index].self_attn.prefill_projection_pad_to = tokens
 
     def _init_model(
         self,

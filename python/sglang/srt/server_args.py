@@ -468,6 +468,7 @@ class ServerArgs:
     pdmux_pp_max_inflight_prefill: Optional[int] = None
     pdmux_pp_prefill_chunk_size: int = 0
     pdmux_pp_max_inflight_tokens: int = 0
+    pdmux_pp_prefill_projection_pad_to: int = 0
     pdmux_pp_radix_eviction: str = "lru"
     sm_group_num: int = 8
 
@@ -2833,6 +2834,12 @@ class ServerArgs:
             help="MuxWise-PP pipeline prefill token budget (0 keeps whole batches).",
         )
         parser.add_argument(
+            "--pdmux-pp-prefill-projection-pad-to",
+            type=int,
+            default=ServerArgs.pdmux_pp_prefill_projection_pad_to,
+            help="Keep short CPP QKV/output projection rows at a fixed GEMM size (0 disables).",
+        )
+        parser.add_argument(
             "--pdmux-pp-max-inflight-tokens",
             type=int,
             default=ServerArgs.pdmux_pp_max_inflight_tokens,
@@ -3010,6 +3017,9 @@ class ServerArgs:
             assert self.pdmux_pp_max_inflight_prefill > 0
         assert self.pdmux_pp_prefill_chunk_size >= 0
         assert self.pdmux_pp_max_inflight_tokens >= 0
+        assert self.pdmux_pp_prefill_projection_pad_to >= 0
+        if self.pdmux_pp_prefill_projection_pad_to:
+            assert self.pdmux_pp_prefill_chunk_size > 0
         if self.pdmux_pp_prefill_chunk_size or self.pdmux_pp_max_inflight_tokens:
             assert self.enable_pdmux and self.pp_size > 1
         if self.enable_pdmux:
