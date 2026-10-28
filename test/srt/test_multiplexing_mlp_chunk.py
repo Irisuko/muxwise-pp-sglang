@@ -132,3 +132,53 @@ def test_projection_padding_never_adds_attention_queries(full_tokens, mode):
     torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
     padded = full_tokens > 8 and mode == ForwardMode.SPLIT_PREFILL
     assert layer.qkv_proj.rows == layer.o_proj.rows == [8 if padded else 3]
+
+
+@pytest.mark.parametrize("reduce_results", [False, True])
+@pytest.mark.parametrize("mode", [ForwardMode.SPLIT_PREFILL, ForwardMode.DECODE])
+@torch.no_grad()
+def test_cpp_padding_preserves_gemm_but_excludes_dummy_tp_rows(
+    monkeypatch, reduce_results, mode
+):
+    """Two identical shards must sum once, communicating only real token rows."""
+    reduced_shapes = []
+
+    def reduce(tensor):
+        reduced_shapes.append(tuple(tensor.shape))
+        assert tensor.is_contiguous()
+        return tensor * 2
+
+    class TPLinearPair(LinearPair):
+        tp_size = 2
+
+        def forward(self, x, skip_all_reduce=False):
+            output, bias = super().forward(x)
+            if self.reduce_results and not skip_all_reduce:
+                output = reduce(output)
+            return output, bias
+
+    monkeypatch.setattr(
+        "sglang.srt.models.llama.tensor_model_parallel_all_reduce", reduce
+    )
+    torch.manual_seed(12)
+    layer = LlamaAttention.__new__(LlamaAttention)
+    nn.Module.__init__(layer)
+    layer.q_size, layer.kv_size = 4, 2
+    layer.qkv_proj = LinearPair(5, 8, bias=False, dtype=torch.float64)
+    layer.o_proj = TPLinearPair(4, 5, bias=False, dtype=torch.float64)
+    layer.o_proj.reduce_results = reduce_results
+    layer.qkv_proj.rows, layer.o_proj.rows = [], []
+    layer.rotary_emb = lambda positions, q, k: (q, k)
+    layer.attn = lambda q, k, v, batch: q + torch.cat([k + v, k + v], dim=1)
+    batch = SimpleNamespace(forward_mode=mode, pdmux_pp_full_prefill_tokens=19)
+    inputs, positions = torch.randn(3, 5, dtype=torch.float64), torch.arange(3)
+    expected = layer(positions, inputs, batch)
+    reduced_shapes.clear()
+    layer.qkv_proj.rows.clear()
+    layer.o_proj.rows.clear()
+    layer.prefill_projection_pad_to = 8
+    actual = layer(positions, inputs, batch)
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    assert reduced_shapes == ([(3, 5)] if reduce_results else [])
+    gemm_rows = 8 if mode == ForwardMode.SPLIT_PREFILL else 3
+    assert layer.qkv_proj.rows == layer.o_proj.rows == [gemm_rows]

@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -265,8 +266,18 @@ class LlamaAttention(nn.Module):
         if pad:
             padded = attn_output.new_zeros((tile, attn_output.shape[1]))
             padded[:rows].copy_(attn_output)
-            output, _ = self.o_proj(padded)
-            output = output[:rows]
+            if getattr(self.o_proj, "tp_size", 1) > 1:
+                # Preserve the padded GEMM shape for BF16 reproducibility, but
+                # dummy token rows do not participate in any later operation.
+                # Crop before TP communication: SHM otherwise transfers the
+                # entire padded tile on every layer of a short CPP tail.
+                output, _ = self.o_proj(padded, skip_all_reduce=True)
+                output = output[:rows]
+                if self.o_proj.reduce_results:
+                    output = tensor_model_parallel_all_reduce(output)
+            else:
+                output, _ = self.o_proj(padded)
+                output = output[:rows]
         else:
             output, _ = self.o_proj(attn_output)
         return output
